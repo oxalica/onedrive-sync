@@ -2,7 +2,8 @@
 pkgs.mkShell {
   buildInputs = with pkgs.buildPackages; [
     pkg-config
-    sqlite
+    sqlite.out
+    sqlite-interactive
     openssl
   ];
 }
