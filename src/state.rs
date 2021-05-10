@@ -54,8 +54,8 @@ impl Item {
             DriveItemField::id,
             DriveItemField::name,
             DriveItemField::size,
-            DriveItemField::last_modified_date_time,
             DriveItemField::file,
+            DriveItemField::file_system_info,
             DriveItemField::parent_reference,
             DriveItemField::root,
         ])
@@ -79,8 +79,9 @@ impl Item {
             true => ItemContent::File {
                 size: item.size.context("Missing size for file")? as u64,
                 mtime: humantime::parse_rfc3339(
-                    item.last_modified_date_time
+                    item.file_system_info
                         .as_ref()
+                        .and_then(|v| v.get("lastModifiedDateTime")?.as_str())
                         .context("Missing mtime for file")?,
                 )?,
                 sha1: item
@@ -195,7 +196,7 @@ impl State {
                                 ":parent": item.parent.as_ref().map(|id| &id.0),
                                 ":is_directory": false,
                                 ":size": size,
-                                ":mtime": humantime::format_rfc3339_seconds(mtime).to_string(),
+                                ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
                                 ":sha1": sha1,
                             })?;
                         }
@@ -208,7 +209,7 @@ impl State {
             Self::set_meta(
                 &txn,
                 Meta::DeltaUrlTime,
-                &humantime::format_rfc3339_seconds(fetch_time).to_string(),
+                &humantime::format_rfc3339_nanos(fetch_time).to_string(),
             )?;
         }
         txn.commit()?;
