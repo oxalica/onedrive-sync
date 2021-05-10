@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
 
 mod state;
+mod tree;
 
 const REDIRECT_URI: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
 
@@ -26,6 +27,8 @@ enum Opt {
     Login(OptLogin),
     /// Fetch remote state and update local database without any uploading or downloading.
     Fetch(OptFetch),
+    /// Recursive compare content of current directory with remote state.
+    Status(OptStatus),
 }
 
 #[tokio::main]
@@ -38,6 +41,7 @@ async fn main() -> Result<()> {
     match opt {
         Opt::Login(opt) => main_login(opt, state).await,
         Opt::Fetch(opt) => main_fetch(opt, state).await,
+        Opt::Status(opt) => main_status(opt, state).await,
     }
 }
 
@@ -126,6 +130,23 @@ async fn main_fetch(opt: OptFetch, mut state: State) -> Result<()> {
     let login = state.get_or_login().await?;
     let onedrive = OneDrive::new(login.token, DriveLocation::me());
     state.sync_remote(&onedrive, opt.from_init).await?;
+    Ok(())
+}
+
+#[derive(Debug, StructOpt)]
+struct OptStatus {}
+
+async fn main_status(_: OptStatus, state: State) -> Result<()> {
+    let tree = state.get_tree()?;
+    let diffs = tree.diff(".")?;
+    for diff in diffs {
+        let prefix = match diff {
+            tree::Diff::Add(_) => " A",
+            tree::Diff::Remove(_) => " D",
+            tree::Diff::Modify(_) => " M",
+        };
+        println!("{} {}", prefix, diff.path().display());
+    }
     Ok(())
 }
 

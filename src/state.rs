@@ -1,3 +1,4 @@
+use crate::tree::Tree;
 use anyhow::{bail, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
@@ -259,5 +260,28 @@ impl State {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn get_tree(&self) -> Result<Tree> {
+        let mut stmt = self.conn.prepare(r"SELECT * FROM `items`")?;
+        let items = stmt
+            .query_and_then([], |row| {
+                let content = match row.get("is_directory")? {
+                    true => ItemContent::Directory,
+                    false => ItemContent::File {
+                        size: row.get("size")?,
+                        mtime: humantime::parse_rfc3339(&row.get::<_, String>("mtime")?)?,
+                        sha1: row.get("sha1")?,
+                    },
+                };
+                Ok(Item {
+                    id: ItemId(row.get("id")?),
+                    name: row.get("name")?,
+                    parent: row.get::<_, Option<String>>("parent")?.map(ItemId),
+                    content,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Tree::from_items(items).expect("Invalid remote state"))
     }
 }
