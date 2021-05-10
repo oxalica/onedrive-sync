@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use onedrive_api::{Auth, DriveLocation, OneDrive, Permission};
 use serde::Deserialize;
 use state::{LoginInfo, State};
@@ -116,14 +116,16 @@ whose URL contains `nativeclient?code=`.
 }
 
 #[derive(Debug, StructOpt)]
-struct OptFetch {}
+struct OptFetch {
+    /// Force re-fetch all items instead of incremental (delta) fetch.
+    #[structopt(long)]
+    from_init: bool,
+}
 
-async fn main_fetch(_: OptFetch, mut state: State) -> Result<()> {
-    let login = state
-        .get_login_info()?
-        .context("No login saved. Please run `onedrive-sync login` first")?;
+async fn main_fetch(opt: OptFetch, mut state: State) -> Result<()> {
+    let login = state.get_or_login().await?;
     let onedrive = OneDrive::new(login.token, DriveLocation::me());
-    state.sync_remote(&onedrive).await?;
+    state.sync_remote(&onedrive, opt.from_init).await?;
     Ok(())
 }
 

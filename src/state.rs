@@ -1,12 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
     resource::{DriveItem, DriveItemField},
-    ItemId, OneDrive,
+    Auth, ItemId, OneDrive, Permission,
 };
 use rusqlite::{named_params, params, types::Null, Connection};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::SystemTime};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 #[derive(Debug)]
 pub struct State {
@@ -130,11 +133,47 @@ impl State {
         Ok(())
     }
 
-    pub fn get_login_info(&self) -> Result<Option<LoginInfo>> {
-        Self::get_meta(&self.conn, Meta::LoginInfo)?
+    pub async fn get_or_login(&mut self) -> Result<LoginInfo> {
+        let login: Option<LoginInfo> = Self::get_meta(&self.conn, Meta::LoginInfo)?
             .map(|s| serde_json::from_str(&s))
-            .transpose()
-            .map_err(Into::into)
+            .transpose()?;
+        let login = match login {
+            // FIXME: Refresh earlier?
+            Some(login) if SystemTime::now() < login.token_expire_time => {
+                log::debug!(
+                    "Token still alive. Expiration time: {}",
+                    humantime::format_rfc3339_nanos(login.token_expire_time)
+                );
+                login
+            }
+            Some(mut login) => {
+                log::debug!(
+                    "Token expired at {}, try refresh",
+                    humantime::format_rfc3339_nanos(login.token_expire_time)
+                );
+
+                // FIXME: Dedup with login command?
+                let auth = Auth::new(
+                    login.client_id.clone(),
+                    Permission::new_read().write(true).offline_access(true),
+                    login.redirect_uri.clone(),
+                );
+                let token_resp = auth
+                    .login_with_refresh_token(&login.refresh_token, None)
+                    .await?;
+                login.token = token_resp.access_token;
+                login.refresh_token = token_resp.refresh_token.expect("Missing refresh token");
+                login.token_expire_time =
+                    SystemTime::now() + Duration::from_secs(token_resp.expires_in_secs);
+                self.set_login_info(&login)?;
+                log::debug!("New token saved");
+                login
+            }
+            None => {
+                bail!("No login info saved. Please run `onedrive-sync login` first");
+            }
+        };
+        Ok(login)
     }
 
     pub fn set_login_info(&mut self, new_login: &LoginInfo) -> Result<()> {
@@ -143,22 +182,28 @@ impl State {
         Ok(())
     }
 
-    pub async fn sync_remote(&mut self, onedrive: &OneDrive) -> Result<()> {
+    pub async fn sync_remote(&mut self, onedrive: &OneDrive, from_init: bool) -> Result<()> {
         let txn = self.conn.transaction()?;
         {
             let mut tracker = match Self::get_meta(&txn, Meta::DeltaUrl)? {
-                Some(delta_url) => {
+                Some(delta_url) if !from_init => {
+                    // TODO: Large page.
                     onedrive
                         .track_root_changes_from_delta_url(&delta_url)
                         .await?
                 }
-                None => {
+                _ => {
                     onedrive
                         .track_root_changes_from_initial_with_option(Item::options())
                         .await?
                 }
             };
             let fetch_time = SystemTime::now();
+
+            if from_init {
+                log::debug!("Clear all items in database (--from-init)");
+                txn.execute(r"DELETE FROM `items`", [])?;
+            }
 
             let mut stmt = txn.prepare(
                 r"
