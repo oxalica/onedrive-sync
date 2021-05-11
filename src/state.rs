@@ -203,15 +203,15 @@ impl State {
 
             if from_init {
                 log::debug!("Clear all items in database (--from-init)");
-                txn.execute(r"DELETE FROM `items`", [])?;
+                txn.execute(r"DELETE FROM `item`", [])?;
             }
 
             let mut stmt = txn.prepare(
                 r"
-                    INSERT OR REPLACE INTO `items`
-                    (`id`, `name`, `parent`, `is_directory`, `size`, `mtime`, `sha1`)
+                    INSERT OR REPLACE INTO `item`
+                    (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `mtime`, `sha1`)
                     VALUES
-                    (:id, :name, :parent, :is_directory, :size, :mtime, :sha1)
+                    (:item_id, :item_name, :parent, :is_directory, :size, :mtime, :sha1)
                 ",
             )?;
 
@@ -226,8 +226,8 @@ impl State {
                     match item.content {
                         ItemContent::Directory => {
                             stmt.insert(named_params! {
-                                ":id": item.id.0,
-                                ":name": item.name,
+                                ":item_id": item.id.0,
+                                ":item_name": item.name,
                                 ":parent": item.parent.as_ref().map(|id| &id.0),
                                 ":is_directory": true,
                                 ":size": Null,
@@ -237,8 +237,8 @@ impl State {
                         }
                         ItemContent::File { size, mtime, sha1 } => {
                             stmt.insert(named_params! {
-                                ":id": item.id.0,
-                                ":name": item.name,
+                                ":item_id": item.id.0,
+                                ":item_name": item.name,
                                 ":parent": item.parent.as_ref().map(|id| &id.0),
                                 ":is_directory": false,
                                 ":size": size,
@@ -263,7 +263,7 @@ impl State {
     }
 
     pub fn get_tree(&self) -> Result<Tree> {
-        let mut stmt = self.conn.prepare(r"SELECT * FROM `items`")?;
+        let mut stmt = self.conn.prepare(r"SELECT * FROM `item`")?;
         let items = stmt
             .query_and_then([], |row| {
                 let content = match row.get("is_directory")? {
@@ -275,9 +275,9 @@ impl State {
                     },
                 };
                 Ok(Item {
-                    id: ItemId(row.get("id")?),
-                    name: row.get("name")?,
-                    parent: row.get::<_, Option<String>>("parent")?.map(ItemId),
+                    id: ItemId(row.get("item_id")?),
+                    name: row.get("item_name")?,
+                    parent: row.get::<_, Option<String>>("parent_item_id")?.map(ItemId),
                     content,
                 })
             })?

@@ -11,16 +11,21 @@ INSERT OR IGNORE INTO `meta` VALUES ('login_info', NULL);
 INSERT OR IGNORE INTO `meta` VALUES ('delta_url', NULL);
 INSERT OR IGNORE INTO `meta` VALUES ('delta_url_time', NULL);
 
-CREATE TABLE IF NOT EXISTS `items` (
-    `id`            TEXT NOT NULL PRIMARY KEY,
-    `name`          TEXT NOT NULL,
-    `parent`        TEXT     NULL REFERENCES `items` (id) DEFERRABLE INITIALLY DEFERRED,
-    `is_directory`  INT  NOT NULL,
-    `size`          INT      NULL,
-    `mtime`         TEXT     NULL,
-    `sha1`          TEXT     NULL,
-    CHECK (`is_directory` IS (`size` IS NULL AND `mtime` IS NULL)),
-    CHECK (NOT `is_directory` OR `sha1` IS NULL)
+CREATE TABLE IF NOT EXISTS `item` (
+    `item_id`           TEXT NOT NULL
+                            PRIMARY KEY,
+    `item_name`         TEXT NOT NULL,
+    `parent_item_id`    TEXT NULL
+                            REFERENCES `item` (`item_id`)
+                            DEFERRABLE INITIALLY DEFERRED,
+    `is_directory`      INTEGER NOT NULL
+                            CHECK (`is_directory` IN (0, 1)),
+    `size`              INTEGER NULL
+                            CHECK (`is_directory` = (`size` IS NULL)),
+    `mtime`             TEXT NULL
+                            CHECK (`is_directory` = (`mtime` IS NULL)),
+    `sha1`              TEXT NULL
+                            CHECK (NOT `is_directory` OR `sha1` IS NULL)
 );
 
 COMMIT;
