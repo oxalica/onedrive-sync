@@ -1,4 +1,5 @@
 PRAGMA foreign_keys = ON;
+PRAGMA case_sensitive_like = ON;
 
 BEGIN;
 
@@ -26,6 +27,17 @@ CREATE TABLE IF NOT EXISTS `item` (
                             CHECK (`is_directory` = (`mtime` IS NULL)),
     `sha1`              TEXT NULL
                             CHECK (NOT `is_directory` OR `sha1` IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS `pending` (
+    `pending_id`    INTEGER NOT NULL
+                        PRIMARY KEY AUTOINCREMENT,
+    `item_id`       TEXT NULL UNIQUE
+                        REFERENCES `item`
+                        ON UPDATE RESTRICT
+                        ON DELETE RESTRICT,
+    `local_path`    TEXT NOT NULL,
+    `operation`     TEXT NOT NULL
 );
 
 COMMIT;

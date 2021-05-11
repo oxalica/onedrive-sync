@@ -1,5 +1,5 @@
-use crate::tree::Tree;
-use anyhow::{bail, Context, Result};
+use crate::tree::{RelativePath, Tree};
+use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
     resource::{DriveItem, DriveItemField},
@@ -11,6 +11,7 @@ use std::{
     path::Path,
     time::{Duration, SystemTime},
 };
+use strum::{EnumString, IntoStaticStr};
 
 #[derive(Debug)]
 pub struct State {
@@ -26,7 +27,7 @@ pub struct LoginInfo {
     pub token_expire_time: SystemTime,
 }
 
-#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 enum Meta {
     LoginInfo,
@@ -103,6 +104,26 @@ impl Item {
             parent,
             content,
         })
+    }
+}
+
+#[derive(Debug)]
+pub struct Pending {
+    pub item_id: Option<ItemId>,
+    pub local_path: RelativePath,
+    pub op: PendingOp,
+}
+
+#[derive(Debug, Clone, Copy, IntoStaticStr, EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum PendingOp {
+    Download,
+    Upload,
+}
+
+impl rusqlite::ToSql for PendingOp {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(<&'static str>::from(self).into())
     }
 }
 
@@ -283,5 +304,43 @@ impl State {
             })?
             .collect::<Result<Vec<_>>>()?;
         Ok(Tree::from_items(items).expect("Invalid remote state"))
+    }
+
+    pub fn queue_pending(&mut self, pendings: impl IntoIterator<Item = Pending>) -> Result<()> {
+        let txn = self.conn.transaction()?;
+        {
+            let mut stmt = txn.prepare(
+                r"
+                    INSERT INTO `pending`
+                        (`item_id`, `local_path`, `operation`)
+                        VALUES
+                        (:item_id, :local_path, :operation)
+                ",
+            )?;
+            for pending in pendings {
+                stmt.insert(named_params! {
+                    ":item_id": pending.item_id.as_ref().map(|id| &id.0),
+                    ":local_path": &*pending.local_path,
+                    ":operation": pending.op,
+                })?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn unqueue_pending(&mut self, prefix: &RelativePath) -> Result<usize> {
+        let affected = self.conn.execute(
+            r"
+                DELETE FROM `pending`
+                    WHERE `local_path` = :prefix
+                        OR SUBSTR(`local_path`, 1, LENGTH(:prefix) + 1) = :prefix || '/'
+            ",
+            named_params! {
+                ":prefix": &**prefix,
+            },
+        )?;
+        ensure!(affected != 0, "Not queued: {}", prefix);
+        Ok(affected)
     }
 }

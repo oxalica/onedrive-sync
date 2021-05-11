@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use onedrive_api::{Auth, DriveLocation, OneDrive, Permission};
 use serde::Deserialize;
-use state::{LoginInfo, State};
+use state::{LoginInfo, Pending, PendingOp, State};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
+use tree::{Diff, RelativePath};
 
 mod state;
 mod tree;
@@ -29,6 +30,10 @@ enum Opt {
     Fetch(OptFetch),
     /// Recursive compare content of current directory with remote state.
     Status(OptStatus),
+    /// Queue downloading or uploading of given paths.
+    Add(OptAdd),
+    /// Unqueue previously `add`ed paths.
+    Reset(OptReset),
 }
 
 #[tokio::main]
@@ -42,6 +47,8 @@ async fn main() -> Result<()> {
         Opt::Login(opt) => main_login(opt, state).await,
         Opt::Fetch(opt) => main_fetch(opt, state).await,
         Opt::Status(opt) => main_status(opt, state).await,
+        Opt::Add(opt) => main_add(opt, state).await,
+        Opt::Reset(opt) => main_reset(opt, state).await,
     }
 }
 
@@ -141,12 +148,83 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
     let diffs = tree.diff(".")?;
     for diff in diffs {
         let prefix = match diff {
-            tree::Diff::Add(_) => " A",
-            tree::Diff::Remove(_) => " D",
-            tree::Diff::Modify(_) => " M",
+            Diff::Add(_) => " A",
+            Diff::Remove(_) => " D",
+            Diff::Modify(_) | Diff::DirToFile(_) | Diff::FileToDir(_) => " M",
         };
         println!("{} {}", prefix, diff.path().display());
     }
+    Ok(())
+}
+
+#[derive(Debug, StructOpt)]
+struct OptAdd {
+    /// Paths to queue for download or upload.
+    paths: Vec<PathBuf>,
+    /// Add local path to queue uploading.
+    #[structopt(long, conflicts_with = "remote")]
+    local: bool,
+    /// Add remote path to queue downloading.
+    #[structopt(long)]
+    remote: bool,
+}
+
+async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
+    let tree = state.get_tree()?;
+
+    let mut pendings = Vec::new();
+
+    // TODO: Check with diff.
+    for path in &opt.paths {
+        let mut path = RelativePath::new(path)?;
+        if opt.local {
+            for entry in walkdir::WalkDir::new(&*path).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    pendings.push(Pending {
+                        item_id: None,
+                        local_path: RelativePath::new(entry.path())?,
+                        op: PendingOp::Upload,
+                    });
+                }
+            }
+        } else if opt.remote {
+            let node = tree
+                .resolve(&path)
+                .with_context(|| format!("No remote path found: {}", path))?;
+            node.walk(&mut path, &mut |node, path| {
+                if node.is_file() {
+                    pendings.push(Pending {
+                        item_id: Some(node.id().clone()),
+                        local_path: path.clone(),
+                        op: PendingOp::Download,
+                    });
+                }
+            });
+        } else {
+            bail!("TODO: Auto guess local/remote is not yet supported");
+        }
+    }
+
+    println!("Queue {} file(s)", pendings.len());
+    state.queue_pending(pendings)?;
+
+    Ok(())
+}
+
+#[derive(Debug, StructOpt)]
+struct OptReset {
+    /// Paths to unqueue.
+    paths: Vec<PathBuf>,
+}
+
+async fn main_reset(opt: OptReset, mut state: State) -> Result<()> {
+    let mut affected = 0;
+    for path in &opt.paths {
+        let path = RelativePath::new(path)?;
+        affected += state.unqueue_pending(&path)?;
+    }
+    println!("Unqueued {} file(s)", affected);
     Ok(())
 }
 
