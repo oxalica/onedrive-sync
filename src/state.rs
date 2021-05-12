@@ -8,7 +8,7 @@ use onedrive_api::{
 use rusqlite::{named_params, params, types::Null, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 use strum::{EnumString, IntoStaticStr};
@@ -130,6 +130,18 @@ impl rusqlite::ToSql for PendingOp {
     }
 }
 
+#[derive(Debug)]
+pub struct DownloadTask {
+    pub pending_id: i64,
+    pub item_id: ItemId,
+    pub target_path: PathBuf,
+    pub remote_mtime: SystemTime,
+    pub size: u64,
+    pub ctag: Tag,
+    pub url: Option<String>,
+    pub current_size: Option<u64>,
+}
+
 impl State {
     pub fn new(state_file: &Path) -> Result<Self> {
         // TODO: Exclusive?
@@ -158,6 +170,7 @@ impl State {
         Ok(())
     }
 
+    // TODO: Return OneDrive?
     pub async fn get_or_login(&mut self) -> Result<LoginInfo> {
         let login: Option<LoginInfo> = Self::get_meta(&self.conn, Meta::LoginInfo)?
             .map(|s| serde_json::from_str(&s))
@@ -353,5 +366,61 @@ impl State {
         )?;
         ensure!(affected != 0, "Not queued: {}", prefix);
         Ok(affected)
+    }
+
+    pub fn finish_pending(&mut self, pending_id: i64) -> Result<()> {
+        let affected = self.conn.execute(
+            r"
+                DELETE FROM `pending`
+                    WHERE `pending_id` = ?
+            ",
+            params![pending_id],
+        )?;
+        ensure!(affected == 1, "Pending id {} not found", pending_id);
+        Ok(())
+    }
+
+    pub fn get_pending_download(&self) -> Result<Vec<DownloadTask>> {
+        self.conn
+            .prepare(
+                r"
+                SELECT `pending_id`, `item_id`, `local_path`, `mtime`, `size`, `ctag`, `url`, `current_size`
+                    FROM `pending`
+                    INNER JOIN `item` USING (`item_id`)
+                    LEFT OUTER JOIN `download` USING (`pending_id`)
+            ",
+            )?
+            .query_and_then([], |row| {
+                Ok(DownloadTask {
+                    pending_id: row.get("pending_id")?,
+                    item_id: ItemId(row.get("item_id")?),
+                    // TODO: Relative to sync root?
+                    target_path: PathBuf::from(".").join(row.get::<_, String>("local_path")?),
+                    remote_mtime: humantime::parse_rfc3339(&row.get::<_, String>("mtime")?)?,
+                    size: row.get("size")?,
+                    ctag: Tag(row.get("ctag")?),
+                    url: row.get("url")?,
+                    current_size: row.get("current_size")?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Save `url`, `current_size` for a running download.
+    pub fn save_download_state(&mut self, task: &DownloadTask) -> Result<()> {
+        self.conn.execute(
+            r"
+                INSERT OR REPLACE INTO `download`
+                    (`pending_id`, `url`, `current_size`)
+                    VALUES
+                    (:pending_id, :url, :current_size)
+            ",
+            named_params! {
+                ":pending_id": task.pending_id,
+                ":url": task.url,
+                ":current_size": task.current_size.expect("current_size should not be None"),
+            },
+        )?;
+        Ok(())
     }
 }

@@ -42,4 +42,14 @@ CREATE TABLE IF NOT EXISTS `pending` (
     `operation`     TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS `download` (
+    `pending_id`        INTEGER NOT NULL
+                            PRIMARY KEY
+                            REFERENCES `pending`
+                            ON UPDATE RESTRICT
+                            ON DELETE CASCADE,
+    `url`               TEXT NULL,
+    `current_size`      INTEGER NOT NULL
+);
+
 COMMIT;

@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
 use tree::{Diff, RelativePath};
 
+mod commit;
 mod state;
 mod tree;
 
@@ -34,6 +35,8 @@ enum Opt {
     Add(OptAdd),
     /// Unqueue previously `add`ed paths.
     Reset(OptReset),
+    /// Commit pending download and upload.
+    Commit(OptCommit),
 }
 
 #[tokio::main]
@@ -49,6 +52,7 @@ async fn main() -> Result<()> {
         Opt::Status(opt) => main_status(opt, state).await,
         Opt::Add(opt) => main_add(opt, state).await,
         Opt::Reset(opt) => main_reset(opt, state).await,
+        Opt::Commit(opt) => main_commit(opt, state).await,
     }
 }
 
@@ -225,6 +229,15 @@ async fn main_reset(opt: OptReset, mut state: State) -> Result<()> {
         affected += state.unqueue_pending(&path)?;
     }
     println!("Unqueued {} file(s)", affected);
+    Ok(())
+}
+
+#[derive(Debug, StructOpt)]
+struct OptCommit {}
+
+// TODO: upload
+async fn main_commit(_: OptCommit, state: State) -> Result<()> {
+    commit::commit_download(state).await?;
     Ok(())
 }
 
