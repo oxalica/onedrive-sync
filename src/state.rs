@@ -3,7 +3,7 @@ use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
     resource::{DriveItem, DriveItemField},
-    Auth, ItemId, OneDrive, Permission,
+    Auth, ItemId, OneDrive, Permission, Tag,
 };
 use rusqlite::{named_params, params, types::Null, Connection};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ pub struct Item {
 pub enum ItemContent {
     File {
         size: u64,
+        ctag: Tag,
         mtime: SystemTime,
         sha1: String,
     },
@@ -59,6 +60,7 @@ impl Item {
             DriveItemField::id,
             DriveItemField::name,
             DriveItemField::size,
+            DriveItemField::c_tag,
             DriveItemField::file,
             DriveItemField::file_system_info,
             DriveItemField::parent_reference,
@@ -83,6 +85,7 @@ impl Item {
             false => ItemContent::Directory,
             true => ItemContent::File {
                 size: item.size.context("Missing size for file")? as u64,
+                ctag: item.c_tag.clone().context("Missing c_tag")?,
                 mtime: humantime::parse_rfc3339(
                     item.file_system_info
                         .as_ref()
@@ -230,9 +233,9 @@ impl State {
             let mut stmt = txn.prepare(
                 r"
                     INSERT OR REPLACE INTO `item`
-                    (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `mtime`, `sha1`)
+                    (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `ctag`, `mtime`, `sha1`)
                     VALUES
-                    (:item_id, :item_name, :parent, :is_directory, :size, :mtime, :sha1)
+                    (:item_id, :item_name, :parent, :is_directory, :size, :ctag, :mtime, :sha1)
                 ",
             )?;
 
@@ -252,17 +255,24 @@ impl State {
                                 ":parent": item.parent.as_ref().map(|id| &id.0),
                                 ":is_directory": true,
                                 ":size": Null,
+                                ":ctag": Null,
                                 ":mtime": Null,
                                 ":sha1": Null,
                             })?;
                         }
-                        ItemContent::File { size, mtime, sha1 } => {
+                        ItemContent::File {
+                            size,
+                            ctag,
+                            mtime,
+                            sha1,
+                        } => {
                             stmt.insert(named_params! {
                                 ":item_id": item.id.0,
                                 ":item_name": item.name,
                                 ":parent": item.parent.as_ref().map(|id| &id.0),
                                 ":is_directory": false,
                                 ":size": size,
+                                ":ctag": ctag.0,
                                 ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
                                 ":sha1": sha1,
                             })?;
@@ -291,6 +301,7 @@ impl State {
                     true => ItemContent::Directory,
                     false => ItemContent::File {
                         size: row.get("size")?,
+                        ctag: Tag(row.get("ctag")?),
                         mtime: humantime::parse_rfc3339(&row.get::<_, String>("mtime")?)?,
                         sha1: row.get("sha1")?,
                     },

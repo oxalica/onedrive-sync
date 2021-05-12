@@ -103,6 +103,7 @@ impl Tree {
                     size,
                     mtime,
                     ref sha1,
+                    ..
                 } => TreeNode::File {
                     id: item.id.clone(),
                     size,

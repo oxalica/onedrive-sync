@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS `item` (
                             CHECK (`is_directory` IN (0, 1)),
     `size`              INTEGER NULL
                             CHECK (`is_directory` = (`size` IS NULL)),
+    `ctag`              INTEGER NULL
+                            CHECK (`is_directory` = (`ctag` IS NULL)),
     `mtime`             TEXT NULL
                             CHECK (`is_directory` = (`mtime` IS NULL)),
     `sha1`              TEXT NULL
