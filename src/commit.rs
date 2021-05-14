@@ -133,10 +133,12 @@ async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client
         task.item_id,
     );
 
+    // TODO: atime?
     filetime::set_file_mtime(&temp_file_path, task.remote_mtime.into())?;
     if let Some(parent) = task.target_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // TODO: No replace.
     fs::rename(&temp_file_path, &task.target_path)?;
 
     state.finish_pending(task.pending_id)?;
