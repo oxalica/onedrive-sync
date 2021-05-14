@@ -3,7 +3,7 @@ use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
     resource::{DriveItem, DriveItemField},
-    Auth, FileName, ItemId, OneDrive, Permission, Tag,
+    Auth, DriveLocation, FileName, ItemId, OneDrive, Permission, Tag,
 };
 use rusqlite::{
     named_params, params,
@@ -309,7 +309,7 @@ impl State {
     }
 
     // TODO: Return OneDrive?
-    pub async fn get_or_login(&mut self) -> Result<LoginInfo> {
+    pub async fn get_or_login(&mut self) -> Result<OneDrive> {
         let login: Option<LoginInfo> = Self::get_meta(&self.conn, Meta::LoginInfo)?
             .map(|s| serde_json::from_str(&s))
             .transpose()?;
@@ -349,7 +349,9 @@ impl State {
                 bail!("No login info saved. Please run `onedrive-sync login` first");
             }
         };
-        Ok(login)
+        // TODO: Timeout?
+        let onedrive = OneDrive::new(login.token, DriveLocation::me());
+        Ok(onedrive)
     }
 
     pub fn set_login_info(&mut self, new_login: &LoginInfo) -> Result<()> {

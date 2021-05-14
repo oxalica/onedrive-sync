@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use onedrive_api::{Auth, DriveLocation, OneDrive, Permission};
+use onedrive_api::{Auth, Permission};
 use serde::Deserialize;
 use state::{LoginInfo, OnedrivePath, Pending, PendingOp, State};
 use std::path::PathBuf;
@@ -138,8 +138,7 @@ struct OptFetch {
 }
 
 async fn main_fetch(opt: OptFetch, mut state: State) -> Result<()> {
-    let login = state.get_or_login().await?;
-    let onedrive = OneDrive::new(login.token, DriveLocation::me());
+    let onedrive = state.get_or_login().await?;
     state.sync_remote(&onedrive, opt.from_init).await?;
     Ok(())
 }

@@ -1,8 +1,7 @@
 use crate::state::{DownloadTask, State, UploadTask};
 use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
-    option::DriveItemPutOption, resource::DriveItem, ConflictBehavior, DriveLocation, ItemLocation,
-    OneDrive, UploadSession,
+    option::DriveItemPutOption, resource::DriveItem, ConflictBehavior, ItemLocation, UploadSession,
 };
 use reqwest::{header, Client, StatusCode};
 use std::{
@@ -86,8 +85,7 @@ async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client
             // FIXME: URL may expire.
             Some(url) => url.clone(),
             None => {
-                let login = state.get_or_login().await?;
-                let onedrive = OneDrive::new(login.token, DriveLocation::me());
+                let onedrive = state.get_or_login().await?;
                 let url = onedrive
                     .get_item_download_url(ItemLocation::from_id(&task.item_id))
                     .await?;
@@ -217,8 +215,7 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
             (sess, pos)
         }
         None => {
-            let login = state.get_or_login().await?;
-            let onedrive = OneDrive::new(login.token, DriveLocation::me());
+            let onedrive = state.get_or_login().await?;
             let mut initial = DriveItem::default();
             initial.file_system_info = Some(Box::new(serde_json::json!({
                 "lastModifiedDateTime": humantime::format_rfc3339_nanos(mtime).to_string(),
