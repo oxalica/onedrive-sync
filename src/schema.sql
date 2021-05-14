@@ -52,4 +52,15 @@ CREATE TABLE IF NOT EXISTS `download` (
     `current_size`      INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS `upload` (
+    `pending_id`        INTEGER NOT NULL
+                            PRIMARY KEY
+                            REFERENCES `pending`
+                            ON UPDATE RESTRICT
+                            ON DELETE CASCADE,
+    `lock_size`         INTEGER NOT NULL,
+    `lock_mtime`        TEXT NOT NULL,
+    `session_url`       TEXT NULL
+);
+
 COMMIT;

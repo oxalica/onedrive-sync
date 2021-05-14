@@ -233,11 +233,27 @@ async fn main_reset(opt: OptReset, mut state: State) -> Result<()> {
 }
 
 #[derive(Debug, StructOpt)]
-struct OptCommit {}
+struct OptCommit {
+    /// Only commit pending download.
+    #[structopt(long)]
+    download: bool,
+    /// Only commit pending upload.
+    #[structopt(long)]
+    upload: bool,
+}
 
 // TODO: upload
-async fn main_commit(_: OptCommit, state: State) -> Result<()> {
-    commit::commit_download(state).await?;
+async fn main_commit(opt: OptCommit, mut state: State) -> Result<()> {
+    let (commit_download, commit_upload) = match (opt.download, opt.upload) {
+        (false, false) => (true, true),
+        o => o,
+    };
+    if commit_download {
+        commit::commit_download(&mut state).await?;
+    }
+    if commit_upload {
+        commit::commit_upload(&mut state).await?;
+    }
     Ok(())
 }
 

@@ -142,6 +142,16 @@ pub struct DownloadTask {
     pub current_size: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct UploadTask {
+    pub pending_id: i64,
+    pub remote_path: String,
+    pub local_path: PathBuf,
+    pub lock_size: Option<u64>,
+    pub lock_mtime: Option<SystemTime>,
+    pub session_url: Option<String>,
+}
+
 impl State {
     pub fn new(state_file: &Path) -> Result<Self> {
         // TODO: Exclusive?
@@ -286,6 +296,7 @@ impl State {
                                 ":is_directory": false,
                                 ":size": size,
                                 ":ctag": ctag.0,
+                                // TODO: Abstract `SqlSystemTime`.
                                 ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
                                 ":sha1": sha1,
                             })?;
@@ -368,18 +379,6 @@ impl State {
         Ok(affected)
     }
 
-    pub fn finish_pending(&mut self, pending_id: i64) -> Result<()> {
-        let affected = self.conn.execute(
-            r"
-                DELETE FROM `pending`
-                    WHERE `pending_id` = ?
-            ",
-            params![pending_id],
-        )?;
-        ensure!(affected == 1, "Pending id {} not found", pending_id);
-        Ok(())
-    }
-
     pub fn get_pending_download(&self) -> Result<Vec<DownloadTask>> {
         self.conn
             .prepare(
@@ -388,9 +387,10 @@ impl State {
                     FROM `pending`
                     INNER JOIN `item` USING (`item_id`)
                     LEFT OUTER JOIN `download` USING (`pending_id`)
+                    WHERE `operation` = ?
             ",
             )?
-            .query_and_then([], |row| {
+            .query_and_then(params![PendingOp::Download], |row| {
                 Ok(DownloadTask {
                     pending_id: row.get("pending_id")?,
                     item_id: ItemId(row.get("item_id")?),
@@ -421,6 +421,114 @@ impl State {
                 ":current_size": task.current_size.expect("current_size should not be None"),
             },
         )?;
+        Ok(())
+    }
+
+    pub fn finish_download(&mut self, pending_id: i64) -> Result<()> {
+        let affected = self.conn.execute(
+            r"
+                DELETE FROM `pending`
+                    WHERE `pending_id` = ? AND `operation` = ?
+            ",
+            params![pending_id, PendingOp::Download],
+        )?;
+        ensure!(affected == 1, "Pending download {} not found", pending_id);
+        Ok(())
+    }
+
+    pub fn get_pending_upload(&self) -> Result<Vec<UploadTask>> {
+        self.conn
+            .prepare(
+                r"
+                SELECT `pending_id`, `local_path`, `lock_size`, `lock_mtime`, `session_url`
+                    FROM `pending`
+                    LEFT OUTER JOIN `upload` USING (`pending_id`)
+                    WHERE `operation` = ?
+            ",
+            )?
+            .query_and_then(params![PendingOp::Upload], |row| {
+                let path = row.get::<_, String>("local_path")?;
+                assert!(path.starts_with("./"), "Must be a file starting with `./`");
+                Ok(UploadTask {
+                    pending_id: row.get("pending_id")?,
+                    // TODO: Relative to sync root?
+                    remote_path: path[1..].to_owned(),
+                    local_path: PathBuf::from(".").join(&path),
+                    lock_size: row.get("lock_size")?,
+                    lock_mtime: row
+                        .get::<_, Option<String>>("lock_mtime")?
+                        .map(|tm| humantime::parse_rfc3339(&tm))
+                        .transpose()?,
+                    session_url: row.get("session_url")?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Save `url`, `current_size` for a running download.
+    pub fn save_upload_state(&mut self, task: &UploadTask) -> Result<()> {
+        self.conn.execute(
+            r"
+                INSERT OR REPLACE INTO `upload`
+                    (`pending_id`, `lock_size`, `lock_mtime`, `session_url`)
+                    VALUES
+                    (:pending_id, :lock_size, :lock_mtime, :session_url)
+            ",
+            named_params! {
+                ":pending_id": task.pending_id,
+                ":lock_size": task.lock_size,
+                ":lock_mtime": task.lock_mtime.map(|tm| humantime::format_rfc3339_nanos(tm).to_string()),
+                ":session_url": task.session_url,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_upload(&mut self, pending_id: i64, item: &DriveItem) -> Result<()> {
+        let item = Item::parse_raw_item(item)?;
+
+        let txn = self.conn.transaction()?;
+
+        let affected = txn.execute(
+            r"
+                DELETE FROM `pending`
+                    WHERE `pending_id` = ? AND `operation` = ?
+            ",
+            params![pending_id, PendingOp::Upload],
+        )?;
+        ensure!(affected == 1, "Pending upload {} not found", pending_id);
+
+        // TODO: Merge this with `sync_remote`.
+        match item.content {
+            ItemContent::Directory => unreachable!(),
+            ItemContent::File {
+                size,
+                ctag,
+                mtime,
+                sha1,
+            } => {
+                txn.execute(
+                    r"
+                        INSERT OR REPLACE INTO `item`
+                        (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `ctag`, `mtime`, `sha1`)
+                        VALUES
+                        (:item_id, :item_name, :parent_item_id, :is_directory, :size, :ctag, :mtime, :sha1)
+                    ",
+                    named_params! {
+                        ":item_id": item.id.0,
+                        ":item_name": item.name,
+                        ":parent_item_id": item.parent.as_ref().map(|id| &id.0),
+                        ":is_directory": false,
+                        ":size": size,
+                        ":ctag": ctag.0,
+                        ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
+                        ":sha1": sha1,
+                    }
+                )?;
+            }
+        }
+
+        txn.commit()?;
         Ok(())
     }
 }
