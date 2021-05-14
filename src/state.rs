@@ -1,14 +1,22 @@
-use crate::tree::{RelativePath, Tree};
+use crate::tree::Tree;
 use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
     resource::{DriveItem, DriveItemField},
-    Auth, ItemId, OneDrive, Permission, Tag,
+    Auth, FileName, ItemId, OneDrive, Permission, Tag,
 };
-use rusqlite::{named_params, params, types::Null, Connection};
+use rusqlite::{
+    named_params, params,
+    types::Null,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+    Connection, ToSql,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::{Path, PathBuf},
+    fmt,
+    ops::Deref,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
     time::{Duration, SystemTime},
 };
 use strum::{EnumString, IntoStaticStr};
@@ -48,7 +56,7 @@ pub enum ItemContent {
     File {
         size: u64,
         ctag: Tag,
-        mtime: SystemTime,
+        mtime: Time,
         sha1: String,
     },
     Directory,
@@ -86,12 +94,12 @@ impl Item {
             true => ItemContent::File {
                 size: item.size.context("Missing size for file")? as u64,
                 ctag: item.c_tag.clone().context("Missing c_tag")?,
-                mtime: humantime::parse_rfc3339(
+                mtime: Time(humantime::parse_rfc3339(
                     item.file_system_info
                         .as_ref()
                         .and_then(|v| v.get("lastModifiedDateTime")?.as_str())
                         .context("Missing mtime for file")?,
-                )?,
+                )?),
                 sha1: item
                     .file
                     .as_ref()
@@ -110,11 +118,131 @@ impl Item {
     }
 }
 
+/// A normalized and validated UTF8 path for OneDrive in format `^[.](/[^/])*$` without `.` or `..` in the middle.
+#[derive(Debug, Clone)]
+pub struct OnedrivePath(String);
+
+impl OnedrivePath {
+    pub fn new(path: &Path) -> Result<Self> {
+        let mut buf = ".".to_owned();
+        for comp in path.components() {
+            match comp {
+                Component::Prefix(_) | Component::RootDir => {
+                    bail!("Absolute path is not allowed for remote path")
+                }
+                Component::ParentDir => bail!("`..` is not allowed for remote path"),
+                Component::CurDir => {}
+                Component::Normal(segment) => {
+                    let segment = segment
+                        .to_str()
+                        .context("Non UTF8 path is not allowed for remote path")?;
+                    FileName::new(segment).with_context(|| {
+                        format!("Invalid file name for OneDrive: {:?}", segment)
+                    })?;
+                    // `Path::components` already filters empty components out.
+                    assert!(!segment.is_empty() && segment != "." && segment != "..");
+                    buf.push('/');
+                    buf.push_str(segment);
+                }
+            }
+        }
+        Ok(Self(buf))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        self.0.split('/').skip(1)
+    }
+
+    pub fn push(&mut self, segment: &str) {
+        assert!(
+            !segment.is_empty() && segment != "." && segment != ".." && !segment.contains("/"),
+            "Invalid path segment: {:?}",
+            segment,
+        );
+        self.0.push('/');
+        self.0.push_str(segment);
+    }
+
+    pub fn pop(&mut self) {
+        assert!(self.0 != ".");
+        while self.0.pop() != Some('/') {}
+    }
+}
+
+impl Deref for OnedrivePath {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl fmt::Display for OnedrivePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl rusqlite::ToSql for OnedrivePath {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+impl FromSql for OnedrivePath {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Self::new(Path::new(&String::column_result(value)?))
+            .map_err(|err| FromSqlError::Other(err.into()))
+    }
+}
+
+/// A wrapper for `SystemTime` to pretty print, serialize and deserialize in RFC3339 format.
+#[derive(Debug, Clone, Copy)]
+pub struct Time(SystemTime);
+
+impl From<SystemTime> for Time {
+    fn from(t: SystemTime) -> Self {
+        Self(t)
+    }
+}
+
+impl From<Time> for SystemTime {
+    fn from(t: Time) -> Self {
+        t.0
+    }
+}
+
+impl FromStr for Time {
+    type Err = humantime::TimestampError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        humantime::parse_rfc3339(s).map(Self)
+    }
+}
+
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        humantime::format_rfc3339_nanos(self.0).fmt(f)
+    }
+}
+
+impl ToSql for Time {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Owned(self.to_string().into()))
+    }
+}
+
+impl FromSql for Time {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        String::column_result(value)?
+            .parse::<Self>()
+            .map_err(|err| FromSqlError::Other(err.into()))
+    }
+}
+
 #[derive(Debug)]
 pub struct Pending {
-    pub item_id: Option<ItemId>,
-    pub local_path: RelativePath,
     pub op: PendingOp,
+    pub item_id: Option<ItemId>,
+    pub local_path: OnedrivePath,
 }
 
 #[derive(Debug, Clone, Copy, IntoStaticStr, EnumString)]
@@ -190,14 +318,14 @@ impl State {
             Some(login) if SystemTime::now() < login.token_expire_time => {
                 log::debug!(
                     "Token still alive. Expiration time: {}",
-                    humantime::format_rfc3339_nanos(login.token_expire_time)
+                    Time(login.token_expire_time),
                 );
                 login
             }
             Some(mut login) => {
                 log::debug!(
                     "Token expired at {}, try refresh",
-                    humantime::format_rfc3339_nanos(login.token_expire_time)
+                    Time(login.token_expire_time)
                 );
 
                 // FIXME: Dedup with login command?
@@ -296,8 +424,7 @@ impl State {
                                 ":is_directory": false,
                                 ":size": size,
                                 ":ctag": ctag.0,
-                                // TODO: Abstract `SqlSystemTime`.
-                                ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
+                                ":mtime": mtime,
                                 ":sha1": sha1,
                             })?;
                         }
@@ -307,11 +434,7 @@ impl State {
 
             let delta_url = tracker.delta_url().expect("Missing delta url").to_owned();
             Self::set_meta(&txn, Meta::DeltaUrl, &delta_url)?;
-            Self::set_meta(
-                &txn,
-                Meta::DeltaUrlTime,
-                &humantime::format_rfc3339_nanos(fetch_time).to_string(),
-            )?;
+            Self::set_meta(&txn, Meta::DeltaUrlTime, &Time(fetch_time).to_string())?;
         }
         txn.commit()?;
         Ok(())
@@ -326,7 +449,7 @@ impl State {
                     false => ItemContent::File {
                         size: row.get("size")?,
                         ctag: Tag(row.get("ctag")?),
-                        mtime: humantime::parse_rfc3339(&row.get::<_, String>("mtime")?)?,
+                        mtime: row.get("mtime")?,
                         sha1: row.get("sha1")?,
                     },
                 };
@@ -355,7 +478,7 @@ impl State {
             for pending in pendings {
                 stmt.insert(named_params! {
                     ":item_id": pending.item_id.as_ref().map(|id| &id.0),
-                    ":local_path": &*pending.local_path,
+                    ":local_path": pending.local_path,
                     ":operation": pending.op,
                 })?;
             }
@@ -364,7 +487,7 @@ impl State {
         Ok(())
     }
 
-    pub fn unqueue_pending(&mut self, prefix: &RelativePath) -> Result<usize> {
+    pub fn unqueue_pending(&mut self, prefix: &OnedrivePath) -> Result<usize> {
         let affected = self.conn.execute(
             r"
                 DELETE FROM `pending`
@@ -521,7 +644,7 @@ impl State {
                         ":is_directory": false,
                         ":size": size,
                         ":ctag": ctag.0,
-                        ":mtime": humantime::format_rfc3339_nanos(mtime).to_string(),
+                        ":mtime": mtime,
                         ":sha1": sha1,
                     }
                 )?;

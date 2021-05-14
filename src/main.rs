@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
 use onedrive_api::{Auth, DriveLocation, OneDrive, Permission};
 use serde::Deserialize;
-use state::{LoginInfo, Pending, PendingOp, State};
+use state::{LoginInfo, OnedrivePath, Pending, PendingOp, State};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
-use tree::{Diff, RelativePath};
+use tree::Diff;
 
 mod commit;
 mod state;
@@ -180,14 +180,14 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
 
     // TODO: Check with diff.
     for path in &opt.paths {
-        let mut path = RelativePath::new(path)?;
+        let mut path = OnedrivePath::new(path)?;
         if opt.local {
             for entry in walkdir::WalkDir::new(&*path).follow_links(false) {
                 let entry = entry?;
                 if entry.file_type().is_file() {
                     pendings.push(Pending {
                         item_id: None,
-                        local_path: RelativePath::new(entry.path())?,
+                        local_path: OnedrivePath::new(entry.path())?,
                         op: PendingOp::Upload,
                     });
                 }
@@ -225,7 +225,7 @@ struct OptReset {
 async fn main_reset(opt: OptReset, mut state: State) -> Result<()> {
     let mut affected = 0;
     for path in &opt.paths {
-        let path = RelativePath::new(path)?;
+        let path = OnedrivePath::new(path)?;
         affected += state.unqueue_pending(&path)?;
     }
     println!("Unqueued {} file(s)", affected);

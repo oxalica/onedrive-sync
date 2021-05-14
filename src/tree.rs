@@ -1,11 +1,9 @@
-use crate::state;
-use anyhow::{bail, ensure, Context, Result};
+use crate::state::{self, OnedrivePath, Time};
+use anyhow::{ensure, Context, Result};
 use onedrive_api::ItemId;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt,
-    ops::Deref,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -19,7 +17,7 @@ pub enum TreeNode {
     File {
         id: ItemId,
         size: u64,
-        mtime: SystemTime,
+        mtime: Time,
         sha1: String,
     },
     Directory {
@@ -46,7 +44,7 @@ impl TreeNode {
         }
     }
 
-    pub fn walk(&self, path: &mut RelativePath, cb: &mut impl FnMut(&TreeNode, &RelativePath)) {
+    pub fn walk(&self, path: &mut OnedrivePath, cb: &mut impl FnMut(&TreeNode, &OnedrivePath)) {
         cb(self, path);
         if let Some(children) = self.children() {
             for (name, child) in children {
@@ -117,7 +115,7 @@ impl Tree {
         Ok(Self { root })
     }
 
-    pub fn resolve(&self, path: &RelativePath) -> Option<&TreeNode> {
+    pub fn resolve(&self, path: &OnedrivePath) -> Option<&TreeNode> {
         let mut cur = &self.root;
         for segment in path.iter() {
             cur = cur.children()?.get(segment)?;
@@ -150,7 +148,7 @@ fn diff_helper(node: &TreeNode, path: &mut PathBuf, out: &mut Vec<Diff>) -> Resu
         // TODO: Check sha1.
         (TreeNode::File { size, mtime, .. }, false) => {
             let local_mtime = meta.modified()?;
-            if *size != meta.len() || !eq_time(*mtime, local_mtime) {
+            if *size != meta.len() || !eq_time((*mtime).into(), local_mtime) {
                 out.push(Diff::Modify(path.to_owned()));
             }
         }
@@ -213,62 +211,5 @@ impl Diff {
             | Self::DirToFile(p)
             | Self::FileToDir(p) => p,
         }
-    }
-}
-
-/// A normalized UTF8 relative path in format `^[.](/[^/])*$` and have no `.` or `..` in the middle.
-#[derive(Debug, Clone)]
-pub struct RelativePath(String);
-
-impl RelativePath {
-    pub fn new(path: &Path) -> Result<Self> {
-        let mut buf = ".".to_owned();
-        for comp in path.components() {
-            match comp {
-                Component::Prefix(_) | Component::RootDir => {
-                    bail!("Absolute path is not allowed for remote path")
-                }
-                Component::ParentDir => bail!("`..` is not allowed for remote path"),
-                Component::CurDir => {}
-                Component::Normal(part) => {
-                    let part = part
-                        .to_str()
-                        .context("Non UTF8 path is not allowed for remote path")?;
-                    // `Path::components` already filters empty components out.
-                    assert!(!part.is_empty() && part != "." && part != "..");
-                    buf.push('/');
-                    buf.push_str(part);
-                }
-            }
-        }
-        Ok(Self(buf))
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
-        self.0.split('/').skip(1)
-    }
-
-    pub fn push(&mut self, segment: &str) {
-        assert!(!segment.is_empty() && segment != "." && segment != ".." && !segment.contains("/"));
-        self.0.push('/');
-        self.0.push_str(segment);
-    }
-
-    pub fn pop(&mut self) {
-        assert!(self.0 != ".");
-        while self.0.pop() != Some('/') {}
-    }
-}
-
-impl Deref for RelativePath {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        &*self.0
-    }
-}
-
-impl fmt::Display for RelativePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
     }
 }
