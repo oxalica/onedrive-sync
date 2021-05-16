@@ -1,27 +1,19 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{Auth, Permission};
-use serde::Deserialize;
 use state::{LoginInfo, OnedrivePath, Pending, PendingOp, State};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
 use tree::Diff;
 
+use crate::tree::Tree;
+
 mod commit;
+mod config;
 mod state;
 mod tree;
 
 const REDIRECT_URI: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
-
-#[derive(Debug, Deserialize)]
-pub struct Config {
-    client_id: String,
-    redirect_uri: String,
-    #[serde(default)]
-    write: bool,
-    #[serde(default = "default_state_file")]
-    state_file: PathBuf,
-}
 
 #[derive(Debug, StructOpt)]
 enum Opt {
@@ -43,7 +35,7 @@ enum Opt {
 async fn main() -> Result<()> {
     env_logger::init();
 
-    let state = State::new(&default_state_file())?;
+    let state = State::new(".", &default_state_file())?;
 
     let opt = Opt::from_args();
     match opt {
@@ -146,16 +138,31 @@ async fn main_fetch(opt: OptFetch, mut state: State) -> Result<()> {
 #[derive(Debug, StructOpt)]
 struct OptStatus {}
 
+// TODO: Show pending operations.
 async fn main_status(_: OptStatus, state: State) -> Result<()> {
-    let tree = state.get_tree()?;
-    let diffs = tree.diff(".")?;
-    for diff in diffs {
-        let prefix = match diff {
-            Diff::Add(_) => " A",
-            Diff::Remove(_) => " D",
-            Diff::Modify(_) | Diff::DirToFile(_) | Diff::FileToDir(_) => " M",
-        };
-        println!("{} {}", prefix, diff.path().display());
+    let remote_tree = state.get_tree()?;
+    let remote_tree = remote_tree
+        .resolve(&state.config().onedrive.remote_path)
+        .context("Remote path of sync root is gone")?;
+    log::trace!("Remote tree: {:#?}", remote_tree);
+    let local_tree = Tree::scan_recursive(state.root_dir())?;
+    log::trace!("Local tree: {:#?}", local_tree);
+    let diffs = local_tree.diff(&remote_tree, &OnedrivePath::default());
+    log::debug!("Got {} diff", diffs.len());
+
+    for diff in &diffs {
+        match diff {
+            Diff::Left { path, lhs } => {
+                // FIXME: Print path relative to CWD.
+                println!("L  {} {}", path, lhs.calc_attr());
+            }
+            Diff::Right { path, rhs } => {
+                println!(" R {} {}", path, rhs.calc_attr());
+            }
+            Diff::Conflict { path, lhs, rhs } => {
+                println!("LR {} L:{} R:{}", path, lhs.calc_attr(), rhs.calc_attr());
+            }
+        }
     }
     Ok(())
 }
@@ -172,40 +179,176 @@ struct OptAdd {
     remote: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Strategy {
+    Auto,
+    KeepLocal,
+    KeepRemote,
+}
+
+fn add_pending_diff<'a>(
+    pendings: &mut Vec<Pending>,
+    strategy: Strategy,
+    diffs: impl IntoIterator<Item = &'a Diff<'a>>,
+    mut path_filter: impl FnMut(&OnedrivePath) -> bool,
+) {
+    log::debug!("Adding diff with strategy {:?}", strategy);
+    match strategy {
+        Strategy::Auto => unreachable!(),
+        Strategy::KeepLocal => {
+            for diff in diffs {
+                diff.lhs().unwrap().walk(&diff.path(), |node, path| {
+                    if node.is_file() && path_filter(path) {
+                        pendings.push(Pending {
+                            item_id: None,
+                            local_path: path.clone(),
+                            op: PendingOp::Upload,
+                        });
+                    }
+                });
+            }
+        }
+        Strategy::KeepRemote => {
+            for diff in diffs {
+                diff.rhs().unwrap().walk(&diff.path(), |node, path| {
+                    if node.is_file() && path_filter(path) {
+                        pendings.push(Pending {
+                            item_id: Some(node.item_id().expect("Already from remote").clone()),
+                            local_path: path.clone(),
+                            op: PendingOp::Download,
+                        });
+                    }
+                });
+            }
+        }
+    }
+}
+
 async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
-    let tree = state.get_tree()?;
+    // TODO: Dedup with `status`.
+    let remote_tree = state.get_tree()?;
+    let remote_tree = remote_tree
+        .resolve(&state.config().onedrive.remote_path)
+        .context("Remote path of sync root is gone")?;
+    let local_tree = Tree::scan_recursive(state.root_dir())?;
+    let diffs = local_tree.diff(&remote_tree, &OnedrivePath::default());
+    log::debug!("Got {} diff", diffs.len());
+
+    let local_cwd = OnedrivePath::new(
+        std::fs::canonicalize(".")?.strip_prefix(state.root_dir().canonicalize()?)?,
+    )?;
+    log::debug!("Local cwd from sync root: {}", local_cwd);
+
+    let strategy = match (opt.local, opt.remote) {
+        (true, false) => Strategy::KeepLocal,
+        (false, true) => Strategy::KeepRemote,
+        (false, false) => Strategy::Auto,
+        (true, true) => unreachable!("Checked by structopt"),
+    };
 
     let mut pendings = Vec::new();
 
-    // TODO: Check with diff.
     for path in &opt.paths {
-        let mut path = OnedrivePath::new(path)?;
-        if opt.local {
-            for entry in walkdir::WalkDir::new(&*path).follow_links(false) {
-                let entry = entry?;
-                if entry.file_type().is_file() {
-                    pendings.push(Pending {
-                        item_id: None,
-                        local_path: OnedrivePath::new(entry.path())?,
-                        op: PendingOp::Upload,
-                    });
+        let path_to_add = local_cwd.join_os(path)?;
+        log::debug!("Try adding local path: {}", path_to_add);
+
+        // The path to add is under (but is not) a diff node, so it's only available in one side.
+        // /
+        // `-a      <- Diff node. Only in local or remote.
+        //   `-b    <- Path to add.
+        //   ` `-c
+        //   `-d
+        let decision = if let Some(diff) = diffs.iter().find(|diff| {
+            path_to_add.starts_with(diff.path())
+                && path_to_add.as_str().len() != diff.path().as_str().len()
+        }) {
+            log::debug!("Path to add is under diff: {:?}", diff);
+
+            let strategy = match diff {
+                Diff::Left { path, lhs } => {
+                    ensure!(lhs.is_directory(), "Is a file: {}", path);
+                    ensure!(
+                        strategy != Strategy::KeepRemote,
+                        "Only in local: {}",
+                        path_to_add,
+                    );
+                    Strategy::KeepLocal
+                }
+                Diff::Right { path, rhs } => {
+                    ensure!(rhs.is_directory(), "Is a file: {}", path);
+                    ensure!(
+                        strategy != Strategy::KeepLocal,
+                        "Only in remote: {}",
+                        path_to_add,
+                    );
+                    Strategy::KeepRemote
+                }
+                Diff::Conflict { path, .. } => {
+                    bail!("Is a file: {}", path)
+                }
+            };
+
+            add_pending_diff(&mut pendings, strategy, std::iter::once(diff), |path| {
+                path.starts_with(&path_to_add)
+            });
+            strategy
+
+        // The path is a common prefix in both local and remote.
+        // /
+        // `-a      <- Common prefix in both local and remote. (No diff)
+        //   `-b    <- Path to add.
+        //   ` `-c  <- Maybe diff.
+        //   `-d
+        // `-e      <- Maybe diff.
+        } else {
+            log::debug!("Path to add is a common prefix");
+
+            // All diff nodes selected by the path to add.
+            let selected = diffs
+                .iter()
+                .filter(|diff| diff.path().starts_with(&path_to_add));
+
+            // Validate strategy or auto guess.
+            let (mut has_left, mut has_right) = (false, false);
+            for diff in selected.clone() {
+                match (strategy, diff) {
+                    (Strategy::KeepRemote, Diff::Left { path, .. }) => {
+                        bail!("Only in local: {}", path);
+                    }
+                    (Strategy::KeepLocal, Diff::Right { path, .. }) => {
+                        bail!("Only in remote: {}", path);
+                    }
+                    (_, Diff::Left { .. }) => has_left = true,
+                    (_, Diff::Right { .. }) => has_right = true,
+                    (Strategy::Auto, Diff::Conflict { path, .. }) => {
+                        bail!(
+                            "Found conflict {:?}, please specify `--local` or `--remote`",
+                            path
+                        );
+                    }
+                    _ => {}
                 }
             }
-        } else if opt.remote {
-            let node = tree
-                .resolve(&path)
-                .with_context(|| format!("No remote path found: {}", path))?;
-            node.walk(&mut path, &mut |node, path| {
-                if node.is_file() {
-                    pendings.push(Pending {
-                        item_id: Some(node.id().clone()),
-                        local_path: path.clone(),
-                        op: PendingOp::Download,
-                    });
-                }
-            });
-        } else {
-            bail!("TODO: Auto guess local/remote is not yet supported");
+
+            let strategy = match (has_left, has_right, strategy) {
+                (false, false, _) => bail!("No diff on {}", path_to_add),
+                (false, true, Strategy::Auto) => Strategy::KeepRemote,
+                (true, false, Strategy::Auto) => Strategy::KeepLocal,
+                (true, true, Strategy::Auto) => bail!(
+                    "Found both local-only and remote-only paths under {}. Please specify `--local` or `--remote`",
+                    path_to_add,
+                ),
+                _ => strategy
+            };
+
+            add_pending_diff(&mut pendings, strategy, selected, |_| true);
+            strategy
+        };
+
+        match decision {
+            Strategy::Auto => unreachable!(),
+            Strategy::KeepLocal => println!("Added <local>{}", path_to_add),
+            Strategy::KeepRemote => println!("Added <remote>{}", path_to_add),
         }
     }
 
@@ -222,9 +365,12 @@ struct OptReset {
 }
 
 async fn main_reset(opt: OptReset, mut state: State) -> Result<()> {
+    let local_cwd = OnedrivePath::new(
+        std::fs::canonicalize(".")?.strip_prefix(state.root_dir().canonicalize()?)?,
+    )?;
     let mut affected = 0;
     for path in &opt.paths {
-        let path = OnedrivePath::new(path)?;
+        let path = local_cwd.join_os(path)?;
         affected += state.unqueue_pending(&path)?;
     }
     println!("Unqueued {} file(s)", affected);

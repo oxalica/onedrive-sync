@@ -26,6 +26,7 @@ pub async fn commit_upload(state: &mut State) -> Result<()> {
     let tasks = state.get_pending_upload()?;
     let client = Client::new();
     println!("{} upload task in total", tasks.len());
+    // TODO: Create directories first.
     for task in tasks {
         upload_one(task, state, &client).await?;
     }
@@ -41,10 +42,10 @@ async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client
         PathBuf::from(".onedrive-sync-temp").join(format!("download.{}.part", task.pending_id));
 
     log::debug!(
-        "Start downloading {} bytes of {:?}, target: {:?}, temp file: {}",
+        "Start downloading {} bytes of {:?}, destination: {}, temp file: {}",
         task.size,
         task.item_id,
-        task.target_path.display(),
+        task.dest_path.display(),
         temp_file_path.display(),
     );
 
@@ -140,25 +141,25 @@ async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client
     file.flush()?;
     assert_eq!(pos, task.size);
     log::debug!(
-        "Finished downloading {} bytes of {:?}, target: {:?}",
+        "Finished downloading {} bytes of {:?}, destination: {}",
         task.size,
         task.item_id,
-        task.target_path.display(),
+        task.dest_path.display(),
     );
 
     // TODO: atime?
     filetime::set_file_mtime(&temp_file_path, task.remote_mtime.into())?;
-    if let Some(parent) = task.target_path.parent() {
+    if let Some(parent) = task.dest_path.parent() {
         fs::create_dir_all(parent)?;
     }
     // TODO: No replace.
-    fs::rename(&temp_file_path, &task.target_path)?;
+    fs::rename(&temp_file_path, &task.dest_path)?;
 
     state.finish_download(task.pending_id)?;
     log::debug!(
         "Recovered mtime and placed {:?} to {}",
         task.item_id,
-        task.target_path.display(),
+        task.dest_path.display(),
     );
 
     Ok(())
@@ -167,7 +168,7 @@ async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client
 async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) -> Result<()> {
     const UPLOAD_PART_SIZE: usize = 4 << 20; // 4 MiB
 
-    let mut file = fs::File::open(&task.local_path)?;
+    let mut file = fs::File::open(&task.src_path)?;
     let meta = file.metadata()?;
 
     let size = meta.len();
@@ -198,7 +199,7 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
     log::debug!(
         "Start uploading {} bytes of {}, remote: {}",
         size,
-        task.local_path.display(),
+        task.src_path.display(),
         task.remote_path,
     );
 
@@ -223,7 +224,8 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
             // TODO: Save expiration time?
             let (sess, _meta) = onedrive
                 .new_upload_session_with_initial_option(
-                    ItemLocation::from_path(&task.remote_path).context("Invalid remote path")?,
+                    ItemLocation::from_path(task.remote_path.as_str())
+                        .context("Invalid remote path")?,
                     &initial,
                     // FIXME: Also use ctag?
                     DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace),
@@ -235,7 +237,8 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
         }
     };
 
-    assert!(start_pos <= size);
+    // FIXME: Empty file.
+    assert!(start_pos < size);
     file.seek(SeekFrom::Start(start_pos))?;
     let mut file = BufReader::new(file);
 
@@ -264,14 +267,14 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
     }
 
     let item = item.unwrap();
-    state.finish_upload(task.pending_id, &item)?;
     log::debug!(
         "Finished uploading {} bytes of {:?}, remote: {}, id: {:?}",
         size,
-        task.local_path.display(),
+        task.src_path.display(),
         task.remote_path,
         item.id,
     );
+    state.finish_upload(task.pending_id, &item)?;
 
     Ok(())
 }

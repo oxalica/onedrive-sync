@@ -1,4 +1,4 @@
-use crate::tree::Tree;
+use crate::{config::Config, tree::Tree};
 use anyhow::{bail, ensure, Context, Result};
 use onedrive_api::{
     option::CollectionOption,
@@ -13,8 +13,8 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fmt,
-    ops::Deref,
     path::{Component, Path, PathBuf},
     str::FromStr,
     time::{Duration, SystemTime},
@@ -24,6 +24,8 @@ use strum::{EnumString, IntoStaticStr};
 #[derive(Debug)]
 pub struct State {
     conn: rusqlite::Connection,
+    root_dir: PathBuf,
+    config: Config,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -118,67 +120,105 @@ impl Item {
     }
 }
 
-/// A normalized and validated UTF8 path for OneDrive in format `^[.](/[^/])*$` without `.` or `..` in the middle.
-#[derive(Debug, Clone)]
+/// A normalized and validated UTF8 absolute path for OneDrive in format `^(/[^/])*$` (empty for root)
+/// without `.` or `..` in the middle.
+#[derive(Debug, Clone, Default)]
 pub struct OnedrivePath(String);
 
 impl OnedrivePath {
+    pub fn validate_segment(segment: &OsStr) -> Result<&str> {
+        ensure!(!segment.is_empty() && segment != "." && segment != "..");
+        let segment = segment
+            .to_str()
+            .context("Non UTF8 path is not allowed for remote path")?;
+        FileName::new(segment)
+            .with_context(|| format!("Invalid file name for OneDrive: {:?}", segment))?;
+        Ok(segment)
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
-        let mut buf = ".".to_owned();
+        let mut this = Self::default();
         for comp in path.components() {
             match comp {
-                Component::Prefix(_) | Component::RootDir => {
-                    bail!("Absolute path is not allowed for remote path")
-                }
+                Component::Prefix(p) => bail!("Prefix is not allowed for remote path: {:?}", p),
                 Component::ParentDir => bail!("`..` is not allowed for remote path"),
-                Component::CurDir => {}
-                Component::Normal(segment) => {
-                    let segment = segment
-                        .to_str()
-                        .context("Non UTF8 path is not allowed for remote path")?;
-                    FileName::new(segment).with_context(|| {
-                        format!("Invalid file name for OneDrive: {:?}", segment)
-                    })?;
-                    // `Path::components` already filters empty components out.
-                    assert!(!segment.is_empty() && segment != "." && segment != "..");
-                    buf.push('/');
-                    buf.push_str(segment);
-                }
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(segment) => this.push(segment)?,
             }
         }
-        Ok(Self(buf))
+        Ok(this)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn starts_with(&self, prefix: &Self) -> bool {
+        let len = prefix.0.len();
+        self.0.starts_with(&prefix.0) && self.0.as_bytes().get(len).map_or(true, |&b| b == b'/')
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
         self.0.split('/').skip(1)
     }
 
-    pub fn push(&mut self, segment: &str) {
-        assert!(
-            !segment.is_empty() && segment != "." && segment != ".." && !segment.contains("/"),
-            "Invalid path segment: {:?}",
-            segment,
-        );
+    pub fn push(&mut self, segment: impl AsRef<OsStr>) -> Result<()> {
         self.0.push('/');
-        self.0.push_str(segment);
+        self.0.push_str(Self::validate_segment(segment.as_ref())?);
+        Ok(())
     }
 
-    pub fn pop(&mut self) {
-        assert!(self.0 != ".");
-        while self.0.pop() != Some('/') {}
+    pub fn pop(&mut self) -> bool {
+        if self.as_str().is_empty() {
+            false
+        } else {
+            while self.0.pop() != Some('/') {}
+            true
+        }
     }
-}
 
-impl Deref for OnedrivePath {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        &*self.0
+    /// Convert to a filesystem path under the given root.
+    pub fn root_at(&self, root: impl Into<PathBuf>) -> PathBuf {
+        if self.0.is_empty() {
+            root.into()
+        } else {
+            root.into().join(&self.0[1..])
+        }
+    }
+
+    pub fn join(&self, rhs: &Self) -> Self {
+        // '/foo/bar' + '/baz/zab' -> '/foo/bar/baz/zab'
+        Self(format!("{}{}", self.0, rhs.0))
+    }
+
+    pub fn join_str(&self, segment: &str) -> Result<Self> {
+        let segment = Self::validate_segment(segment.as_ref())?;
+        Ok(Self(format!("{}/{}", self.0, segment)))
+    }
+
+    pub fn join_os(&self, rhs: impl AsRef<Path>) -> Result<Self> {
+        let mut this = self.clone();
+        for comp in rhs.as_ref().components() {
+            match comp {
+                Component::Prefix(_) | Component::RootDir => {
+                    bail!("Cannot reference file by absolute path")
+                }
+                Component::CurDir => {}
+                Component::ParentDir => ensure!(this.pop(), "`..` gets out of sync root directory"),
+                Component::Normal(segment) => this.push(segment)?,
+            }
+        }
+        Ok(this)
     }
 }
 
 impl fmt::Display for OnedrivePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        if self.0.is_empty() {
+            f.write_str("/")
+        } else {
+            self.0.fmt(f)
+        }
     }
 }
 
@@ -192,6 +232,17 @@ impl FromSql for OnedrivePath {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         Self::new(Path::new(&String::column_result(value)?))
             .map_err(|err| FromSqlError::Other(err.into()))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OnedrivePath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = <&str>::deserialize(deserializer)?;
+        Self::new(Path::new(s)).map_err(D::Error::custom)
     }
 }
 
@@ -262,7 +313,7 @@ impl rusqlite::ToSql for PendingOp {
 pub struct DownloadTask {
     pub pending_id: i64,
     pub item_id: ItemId,
-    pub target_path: PathBuf,
+    pub dest_path: PathBuf,
     pub remote_mtime: SystemTime,
     pub size: u64,
     pub ctag: Tag,
@@ -273,22 +324,43 @@ pub struct DownloadTask {
 #[derive(Debug)]
 pub struct UploadTask {
     pub pending_id: i64,
-    pub remote_path: String,
-    pub local_path: PathBuf,
+    pub remote_path: OnedrivePath,
+    pub src_path: PathBuf,
     pub lock_size: Option<u64>,
     pub lock_mtime: Option<SystemTime>,
     pub session_url: Option<String>,
 }
 
 impl State {
-    pub fn new(state_file: &Path) -> Result<Self> {
-        // TODO: Exclusive?
+    // TODO: Put database under sync root?
+    // TODO: Should login be allowed outside sync dir?
+    pub fn new(search_dir: impl AsRef<Path>, state_file: impl AsRef<Path>) -> Result<Self> {
+        let (root_dir, config) = Config::find_root_and_load(search_dir)?;
+        log::debug!(
+            "Find root dir: {}, config: {:?}",
+            root_dir.display(),
+            config,
+        );
+
+        let state_file = state_file.as_ref();
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = rusqlite::Connection::open(&state_file)?;
         conn.execute_batch(include_str!("./schema.sql"))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            root_dir,
+            config,
+        })
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     fn get_meta(conn: &Connection, key: Meta) -> Result<Option<String>> {
@@ -360,6 +432,7 @@ impl State {
         Ok(())
     }
 
+    // TODO: Handle conflicts with pending operations.
     pub async fn sync_remote(&mut self, onedrive: &OneDrive, from_init: bool) -> Result<()> {
         let txn = self.conn.transaction()?;
         {
@@ -398,6 +471,7 @@ impl State {
                 pages += 1;
 
                 for raw_item in page {
+                    // TODO: Deleted.
                     let item = Item::parse_raw_item(&raw_item)
                         .with_context(|| format!("Cannot parse item: {:?}", raw_item))?;
                     match item.content {
@@ -471,7 +545,7 @@ impl State {
         {
             let mut stmt = txn.prepare(
                 r"
-                    INSERT INTO `pending`
+                    INSERT OR REPLACE INTO `pending`
                         (`item_id`, `local_path`, `operation`)
                         VALUES
                         (:item_id, :local_path, :operation)
@@ -497,7 +571,7 @@ impl State {
                         OR SUBSTR(`local_path`, 1, LENGTH(:prefix) + 1) = :prefix || '/'
             ",
             named_params! {
-                ":prefix": &**prefix,
+                ":prefix": prefix.as_str(),
             },
         )?;
         ensure!(affected != 0, "Not queued: {}", prefix);
@@ -519,8 +593,7 @@ impl State {
                 Ok(DownloadTask {
                     pending_id: row.get("pending_id")?,
                     item_id: ItemId(row.get("item_id")?),
-                    // TODO: Relative to sync root?
-                    target_path: PathBuf::from(".").join(row.get::<_, String>("local_path")?),
+                    dest_path: row.get::<_, OnedrivePath>("local_path")?.root_at(&self.root_dir),
                     remote_mtime: humantime::parse_rfc3339(&row.get::<_, String>("mtime")?)?,
                     size: row.get("size")?,
                     ctag: Tag(row.get("ctag")?),
@@ -572,13 +645,11 @@ impl State {
             ",
             )?
             .query_and_then(params![PendingOp::Upload], |row| {
-                let path = row.get::<_, String>("local_path")?;
-                assert!(path.starts_with("./"), "Must be a file starting with `./`");
+                let local_path: OnedrivePath = row.get("local_path")?;
                 Ok(UploadTask {
                     pending_id: row.get("pending_id")?,
-                    // TODO: Relative to sync root?
-                    remote_path: path[1..].to_owned(),
-                    local_path: PathBuf::from(".").join(&path),
+                    remote_path: self.config.onedrive.remote_path.join(&local_path),
+                    src_path: local_path.root_at(&self.root_dir),
                     lock_size: row.get("lock_size")?,
                     lock_mtime: row
                         .get::<_, Option<String>>("lock_mtime")?
@@ -634,10 +705,16 @@ impl State {
             } => {
                 txn.execute(
                     r"
-                        INSERT OR REPLACE INTO `item`
+                        INSERT INTO `item`
                         (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `ctag`, `mtime`, `sha1`)
                         VALUES
                         (:item_id, :item_name, :parent_item_id, :is_directory, :size, :ctag, :mtime, :sha1)
+                        ON CONFLICT (`item_id`) DO UPDATE SET
+                            `item_name` = :item_name,
+                            `size` = :size,
+                            `ctag` = :ctag,
+                            `mtime` = :mtime,
+                            `sha1` = :sha1
                     ",
                     named_params! {
                         ":item_id": item.id.0,

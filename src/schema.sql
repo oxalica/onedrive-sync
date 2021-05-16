@@ -36,9 +36,8 @@ CREATE TABLE IF NOT EXISTS `pending` (
                         PRIMARY KEY AUTOINCREMENT,
     `item_id`       TEXT NULL UNIQUE
                         REFERENCES `item`
-                        ON UPDATE RESTRICT
                         ON DELETE RESTRICT,
-    `local_path`    TEXT NOT NULL,
+    `local_path`    TEXT NOT NULL UNIQUE,
     `operation`     TEXT NOT NULL
 );
 
@@ -46,7 +45,6 @@ CREATE TABLE IF NOT EXISTS `download` (
     `pending_id`        INTEGER NOT NULL
                             PRIMARY KEY
                             REFERENCES `pending`
-                            ON UPDATE RESTRICT
                             ON DELETE CASCADE,
     `url`               TEXT NULL,
     `current_size`      INTEGER NOT NULL
@@ -56,7 +54,6 @@ CREATE TABLE IF NOT EXISTS `upload` (
     `pending_id`        INTEGER NOT NULL
                             PRIMARY KEY
                             REFERENCES `pending`
-                            ON UPDATE RESTRICT
                             ON DELETE CASCADE,
     `lock_size`         INTEGER NOT NULL,
     `lock_mtime`        TEXT NOT NULL,
