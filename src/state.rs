@@ -609,7 +609,14 @@ impl State {
     pub fn queue_pending(&mut self, pendings: impl IntoIterator<Item = Pending>) -> Result<()> {
         let txn = self.conn.transaction()?;
         {
-            let mut stmt = txn.prepare(
+            // We should delete child paths first, in case of conflict between directory and file.
+            let mut stmt_del = txn.prepare(
+                r"
+                    DELETE FROM `pending`
+                        WHERE SUBSTR(`local_path`, 1, LENGTH(:prefix) + 1) = :prefix || '/'
+                ",
+            )?;
+            let mut stmt_ins = txn.prepare(
                 r"
                     INSERT OR REPLACE INTO `pending`
                         (`item_id`, `local_path`, `operation`)
@@ -618,7 +625,10 @@ impl State {
                 ",
             )?;
             for pending in pendings {
-                stmt.insert(named_params! {
+                stmt_del.execute(named_params! {
+                    ":prefix": pending.local_path
+                })?;
+                stmt_ins.insert(named_params! {
                     ":item_id": pending.item_id.as_ref().map(|id| &id.0),
                     ":local_path": pending.local_path,
                     ":operation": pending.op,

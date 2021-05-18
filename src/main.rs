@@ -146,10 +146,13 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
         .resolve(&state.config().onedrive.remote_path)
         .context("Remote path of sync root is gone")?;
     log::trace!("Remote tree: {:#?}", remote_tree);
+
     let local_tree = Tree::scan_recursive(state.root_dir())?;
     log::trace!("Local tree: {:#?}", local_tree);
+
     let diffs = local_tree.diff(&remote_tree, &OnedrivePath::default());
     log::debug!("Got {} diff", diffs.len());
+    log::trace!("Diff: {:#?}", diffs);
 
     let local_cwd = OnedrivePath::new(
         std::fs::canonicalize(".")?.strip_prefix(state.root_dir().canonicalize()?)?,
@@ -170,7 +173,14 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
                     op: Some(pending.op),
                     pending_count: 0,
                 }) {
-                PendingPrefix::ExactPath { .. } => unreachable!(),
+                // Diff::Conflict between directory and file. But there is a deeper file queued.
+                // So we should keep it as directory.
+                p @ PendingPrefix::ExactPath { .. } => {
+                    *p = PendingPrefix::PrefixPath {
+                        op: Some(pending.op),
+                        pending_count: 1,
+                    };
+                }
                 PendingPrefix::PrefixPath { op, pending_count } => {
                     *pending_count += 1;
                     if *op != Some(pending.op) {
@@ -395,9 +405,12 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
     let remote_tree = remote_tree
         .resolve(&state.config().onedrive.remote_path)
         .context("Remote path of sync root is gone")?;
+
     let local_tree = Tree::scan_recursive(state.root_dir())?;
     let diffs = local_tree.diff(&remote_tree, &OnedrivePath::default());
     log::debug!("Got {} diff", diffs.len());
+
+    log::trace!("Diff: {:#?}", diffs);
 
     let local_cwd = OnedrivePath::new(
         std::fs::canonicalize(".")?.strip_prefix(state.root_dir().canonicalize()?)?,
@@ -435,7 +448,7 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
                     ensure!(
                         strategy != Strategy::KeepRemote,
                         "Only in local: {}",
-                        path_to_add,
+                        path_to_add.relative_to(&local_cwd),
                     );
                     Strategy::KeepLocal
                 }
@@ -444,12 +457,12 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
                     ensure!(
                         strategy != Strategy::KeepLocal,
                         "Only in remote: {}",
-                        path_to_add,
+                        path_to_add.relative_to(&local_cwd),
                     );
                     Strategy::KeepRemote
                 }
                 Diff::Conflict { path, .. } => {
-                    bail!("Is a file: {}", path)
+                    bail!("Is a file: {}", path.relative_to(&local_cwd))
                 }
             };
 
@@ -478,32 +491,32 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
             for diff in selected.clone() {
                 match (strategy, diff) {
                     (Strategy::KeepRemote, Diff::Left { path, .. }) => {
-                        bail!("Only in local: {}", path);
+                        bail!("Only in local: {}", path.relative_to(&local_cwd));
                     }
                     (Strategy::KeepLocal, Diff::Right { path, .. }) => {
-                        bail!("Only in remote: {}", path);
+                        bail!("Only in remote: {}", path.relative_to(&local_cwd));
                     }
                     (_, Diff::Left { .. }) => has_left = true,
                     (_, Diff::Right { .. }) => has_right = true,
                     (Strategy::Auto, Diff::Conflict { path, .. }) => {
                         bail!(
-                            "Found conflict {:?}, please specify `--local` or `--remote`",
-                            path
+                            "Found conflict {}, please specify `--local` or `--remote`",
+                            path.relative_to(&local_cwd),
                         );
                     }
                     _ => {}
                 }
             }
 
-            let strategy = match (has_left, has_right, strategy) {
-                (false, false, _) => bail!("No diff on {}", path_to_add),
-                (false, true, Strategy::Auto) => Strategy::KeepRemote,
-                (true, false, Strategy::Auto) => Strategy::KeepLocal,
-                (true, true, Strategy::Auto) => bail!(
+            let strategy = match (strategy, has_left, has_right) {
+                (Strategy::KeepLocal, _, _) | (Strategy::KeepRemote, _, _) => strategy,
+                (Strategy::Auto, false, false) => bail!("No diff on {}", path_to_add.relative_to(&local_cwd)),
+                (Strategy::Auto, false, true) => Strategy::KeepRemote,
+                (Strategy::Auto, true, false) => Strategy::KeepLocal,
+                (Strategy::Auto, true, true) => bail!(
                     "Found both local-only and remote-only paths under {}. Please specify `--local` or `--remote`",
-                    path_to_add,
+                    path_to_add.relative_to(&local_cwd),
                 ),
-                _ => strategy
             };
 
             add_pending_diff(&mut pendings, strategy, selected, |_| true);
