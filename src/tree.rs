@@ -353,6 +353,22 @@ impl<'a> Diff<'a> {
             Self::Left { .. } => None,
         }
     }
+
+    pub fn into_left(self) -> Result<Self, Self> {
+        match self {
+            this @ Self::Left { .. } => Ok(this),
+            this @ Self::Right { .. } => Err(this),
+            Self::Conflict { path, lhs, .. } => Ok(Self::Left { path, lhs }),
+        }
+    }
+
+    pub fn into_right(self) -> Result<Self, Self> {
+        match self {
+            this @ Self::Left { .. } => Err(this),
+            this @ Self::Right { .. } => Ok(this),
+            Self::Conflict { path, rhs, .. } => Ok(Self::Right { path, rhs }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -122,7 +122,7 @@ impl Item {
 
 /// A normalized and validated UTF8 absolute path for OneDrive in format `^(/[^/])*$` (empty for root)
 /// without `.` or `..` in the middle.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct OnedrivePath(String);
 
 impl OnedrivePath {
@@ -149,8 +149,16 @@ impl OnedrivePath {
         Ok(this)
     }
 
-    pub fn as_str(&self) -> &str {
+    pub fn as_raw_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn raw_ancestors(&self) -> impl Iterator<Item = &str> {
+        std::iter::successors(Some(&*self.0), |s| {
+            let idx = s.rfind('/')?;
+            Some(&s[..idx])
+        })
+        .skip(1)
     }
 
     pub fn starts_with(&self, prefix: &Self) -> bool {
@@ -169,7 +177,7 @@ impl OnedrivePath {
     }
 
     pub fn pop(&mut self) -> bool {
-        if self.as_str().is_empty() {
+        if self.0.is_empty() {
             false
         } else {
             while self.0.pop() != Some('/') {}
@@ -184,6 +192,31 @@ impl OnedrivePath {
         } else {
             root.into().join(&self.0[1..])
         }
+    }
+
+    pub fn relative_to(&self, cwd: &Self) -> String {
+        if self.starts_with(cwd) {
+            return format!(".{}", &self.0[cwd.0.len()..]);
+        }
+        let mut buf = String::new();
+        for ancestor in cwd.raw_ancestors() {
+            buf.push_str("../");
+            if self.0.starts_with(ancestor)
+                && self
+                    .0
+                    .as_bytes()
+                    .get(ancestor.len())
+                    .map_or(true, |&b| b == b'/')
+            {
+                if ancestor.len() < self.0.len() {
+                    buf.push_str(&self.0[ancestor.len() + 1..]);
+                } else {
+                    buf.pop();
+                }
+                return buf;
+            }
+        }
+        unreachable!()
     }
 
     pub fn join(&self, rhs: &Self) -> Self {
@@ -210,6 +243,30 @@ impl OnedrivePath {
         }
         Ok(this)
     }
+}
+
+#[test]
+fn test_onedrive_path_relative_to() {
+    #[track_caller]
+    fn check(path: &str, cwd: &str, expect: &str) {
+        let path = OnedrivePath::new(path.as_ref()).unwrap();
+        let cwd = OnedrivePath::new(cwd.as_ref()).unwrap();
+        assert_eq!(path.relative_to(&cwd), expect);
+    }
+
+    check("/foo/bar/baz", "/", "./foo/bar/baz");
+    check("/foo/bar/baz", "/foo", "./bar/baz");
+    check("/foo/bar/baz", "/foo/bar", "./baz");
+    check("/foo/bar/baz", "/foo/bar/baz", ".");
+
+    check("/foo/bar/baz", "/foo/bar/baz/aaa/bbb", "../..");
+    check("/foo/bar/baz", "/foo/bar/baz/aaa", "..");
+    check("/foo/bar/baz", "/foo/bar/aaa", "../baz");
+    check("/foo/bar/baz", "/foo/bar/aaa/bbb", "../../baz");
+    check("/foo/bar/baz", "/foo/aaa", "../bar/baz");
+    check("/foo/bar/baz", "/foo/aaa/bbb", "../../bar/baz");
+    check("/foo/bar/baz", "/aaa", "../foo/bar/baz");
+    check("/foo/bar/baz", "/aaa/bbb", "../../foo/bar/baz");
 }
 
 impl fmt::Display for OnedrivePath {
@@ -296,7 +353,7 @@ pub struct Pending {
     pub local_path: OnedrivePath,
 }
 
-#[derive(Debug, Clone, Copy, IntoStaticStr, EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum PendingOp {
     Download,
@@ -306,6 +363,15 @@ pub enum PendingOp {
 impl rusqlite::ToSql for PendingOp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(<&'static str>::from(self).into())
+    }
+}
+
+impl rusqlite::types::FromSql for PendingOp {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|err| FromSqlError::Other(Box::new(err)))
     }
 }
 
@@ -571,11 +637,24 @@ impl State {
                         OR SUBSTR(`local_path`, 1, LENGTH(:prefix) + 1) = :prefix || '/'
             ",
             named_params! {
-                ":prefix": prefix.as_str(),
+                ":prefix": prefix.as_raw_str(),
             },
         )?;
         ensure!(affected != 0, "Not queued: {}", prefix);
         Ok(affected)
+    }
+
+    pub fn get_pending(&self) -> Result<Vec<Pending>> {
+        self.conn
+            .prepare(r"SELECT * FROM `pending`")?
+            .query_and_then([], |row| {
+                Ok(Pending {
+                    item_id: row.get::<_, Option<String>>("item_id")?.map(ItemId),
+                    local_path: row.get("local_path")?,
+                    op: row.get("operation")?,
+                })
+            })?
+            .collect()
     }
 
     pub fn get_pending_download(&self) -> Result<Vec<DownloadTask>> {

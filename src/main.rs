@@ -1,8 +1,9 @@
 use anyhow::{bail, ensure, Context, Result};
+use colored::Colorize;
 use onedrive_api::{Auth, Permission};
 use state::{LoginInfo, OnedrivePath, Pending, PendingOp, State};
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+use std::{collections::HashMap, path::PathBuf};
 use structopt::StructOpt;
 use tree::Diff;
 
@@ -150,21 +151,185 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
     let diffs = local_tree.diff(&remote_tree, &OnedrivePath::default());
     log::debug!("Got {} diff", diffs.len());
 
-    for diff in &diffs {
-        match diff {
-            Diff::Left { path, lhs } => {
-                // FIXME: Print path relative to CWD.
-                println!("L  {} {}", path, lhs.calc_attr());
-            }
-            Diff::Right { path, rhs } => {
-                println!(" R {} {}", path, rhs.calc_attr());
-            }
-            Diff::Conflict { path, lhs, rhs } => {
-                println!("LR {} L:{} R:{}", path, lhs.calc_attr(), rhs.calc_attr());
+    let local_cwd = OnedrivePath::new(
+        std::fs::canonicalize(".")?.strip_prefix(state.root_dir().canonicalize()?)?,
+    )?;
+    log::debug!("Local cwd from sync root: {}", local_cwd);
+
+    let pendings = state.get_pending()?;
+    let mut pending_prefix_map = HashMap::new();
+    for pending in &pendings {
+        let path = &pending.local_path;
+        assert!(pending_prefix_map
+            .insert(path.as_raw_str(), PendingPrefix::ExactPath { pending })
+            .is_none());
+        for prefix in path.raw_ancestors() {
+            match pending_prefix_map
+                .entry(prefix)
+                .or_insert_with(|| PendingPrefix::PrefixPath {
+                    op: Some(pending.op),
+                    pending_count: 0,
+                }) {
+                PendingPrefix::ExactPath { .. } => unreachable!(),
+                PendingPrefix::PrefixPath { op, pending_count } => {
+                    *pending_count += 1;
+                    if *op != Some(pending.op) {
+                        *op = None;
+                    }
+                }
             }
         }
     }
+
+    let mut status = StatusResult::default();
+    for diff in diffs {
+        split_diff(diff, &pending_prefix_map, &mut status);
+    }
+
+    if !status.queued_diffs.is_empty() {
+        println!("Files to be commited:");
+        for diff in &status.queued_diffs {
+            println!("  {}", format_diff(diff, &local_cwd).green());
+        }
+        println!();
+    }
+
+    if !status.unqueued_diffs.is_empty() {
+        let non_conflicts = status
+            .unqueued_diffs
+            .iter()
+            .filter(|diff| !matches!(diff, Diff::Conflict { .. }));
+        let conflicts = status
+            .unqueued_diffs
+            .iter()
+            .filter(|diff| matches!(diff, Diff::Conflict { .. }));
+
+        if non_conflicts.clone().next().is_some() {
+            println!("Changes not queued for commit:");
+            for diff in non_conflicts {
+                println!("  {}", format_diff(diff, &local_cwd).red());
+            }
+            println!();
+        }
+
+        if conflicts.clone().next().is_some() {
+            println!("Conflict files:");
+            for diff in conflicts {
+                println!("  {}", format_diff(diff, &local_cwd).red());
+            }
+            println!();
+        }
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StatusResult<'a> {
+    unqueued_diffs: Vec<Diff<'a>>,
+    queued_diffs: Vec<Diff<'a>>,
+}
+
+#[derive(Debug)]
+enum PendingPrefix<'a> {
+    PrefixPath {
+        /// `Some` if all queued operations are the same. `None` otherwise.
+        op: Option<PendingOp>,
+        /// The count of queued operations under this prefix.
+        pending_count: usize,
+    },
+    ExactPath {
+        pending: &'a Pending,
+    },
+}
+
+/// Split `Diff` into queued part and not-queued part.
+/// Maybe recurse into paths when a directory is not fully queued.
+fn split_diff<'a>(
+    diff: Diff<'a>,
+    pending_prefix_map: &HashMap<&str, PendingPrefix<'a>>,
+    out: &mut StatusResult<'a>,
+) {
+    fn resolve_conflict<'a>(diff: Diff<'a>, op: PendingOp) -> Diff<'a> {
+        match op {
+            PendingOp::Download => diff
+                .into_right()
+                .expect("Pending download must has remote file"),
+            PendingOp::Upload => diff
+                .into_left()
+                .expect("Pending upload must has local file"),
+        }
+    }
+
+    match pending_prefix_map.get(&diff.path().as_raw_str()) {
+        // No queued files is under this diff node.
+        None => {
+            out.unqueued_diffs.push(diff);
+        }
+        // The diff node itself is a queued file.
+        Some(PendingPrefix::ExactPath { pending }) => {
+            let op = pending.op;
+            out.queued_diffs.push(resolve_conflict(diff, op));
+        }
+        // The diff node is a directory containing queued files.
+        Some(PendingPrefix::PrefixPath { op, pending_count }) => {
+            // Avoid lifetime issue.
+            let pending_count = *pending_count;
+
+            // In case of directory, `Diff::Conflict` can appears only when
+            // there's file on one side and directory on the other side.
+            let op = op.expect("No mixed operations under a single diff node");
+            let diff = resolve_conflict(diff, op);
+
+            let (is_rhs, mut path, tree) = match diff {
+                Diff::Conflict { .. } => unreachable!(),
+                Diff::Left { path, lhs } => (false, path, lhs),
+                Diff::Right { path, rhs } => (true, path, rhs),
+            };
+            let make_diff = |path, tree| match is_rhs {
+                false => Diff::Left { path, lhs: tree },
+                true => Diff::Right { path, rhs: tree },
+            };
+
+            let mut files = 0usize;
+            tree.walk(&OnedrivePath::default(), |node, _| {
+                if node.is_file() {
+                    files += 1;
+                }
+            });
+
+            // The whole sub-tree is queued.
+            if files == pending_count {
+                out.queued_diffs.push(make_diff(path, tree));
+            // Some deeper path is not queued. Recurse into children.
+            } else {
+                for (name, child) in tree.children().expect("Prefix must be a directory") {
+                    path.push(name).unwrap();
+                    let sub_diff = make_diff(path.clone(), child);
+                    split_diff(sub_diff, pending_prefix_map, out);
+                    path.pop();
+                }
+            }
+        }
+    }
+}
+
+// FIXME: Print path relative to CWD.
+fn format_diff(diff: &Diff<'_>, cwd: &OnedrivePath) -> String {
+    match diff {
+        Diff::Left { path, lhs } => {
+            format!("local:    {} {}", path.relative_to(cwd), lhs.calc_attr())
+        }
+        Diff::Right { path, rhs } => {
+            format!("remote:   {} {}", path.relative_to(cwd), rhs.calc_attr())
+        }
+        Diff::Conflict { path, lhs, rhs } => format!(
+            "conflict: {} local:{} remote:{}",
+            path.relative_to(cwd),
+            lhs.calc_attr(),
+            rhs.calc_attr(),
+        ),
+    }
 }
 
 #[derive(Debug, StructOpt)]
@@ -260,7 +425,7 @@ async fn main_add(opt: OptAdd, mut state: State) -> Result<()> {
         //   `-d
         let decision = if let Some(diff) = diffs.iter().find(|diff| {
             path_to_add.starts_with(diff.path())
-                && path_to_add.as_str().len() != diff.path().as_str().len()
+                && path_to_add.as_raw_str().len() != diff.path().as_raw_str().len()
         }) {
             log::debug!("Path to add is under diff: {:?}", diff);
 

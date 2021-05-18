@@ -224,7 +224,7 @@ async fn upload_one(mut task: UploadTask, state: &mut State, client: &Client) ->
             // TODO: Save expiration time?
             let (sess, _meta) = onedrive
                 .new_upload_session_with_initial_option(
-                    ItemLocation::from_path(task.remote_path.as_str())
+                    ItemLocation::from_path(task.remote_path.as_raw_str())
                         .context("Invalid remote path")?,
                     &initial,
                     // FIXME: Also use ctag?
