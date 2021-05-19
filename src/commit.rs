@@ -1,4 +1,4 @@
-use crate::state::{DownloadTask, State, UploadTask};
+use crate::state::{DownloadTask, State, Time, UploadTask};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
 use colored::Colorize;
@@ -369,9 +369,8 @@ impl Upload {
 
     async fn run(mut self) -> Result<()> {
         let file = self.check_and_open_file().await?;
-        let size = self.task.lock_size.unwrap();
 
-        let item = if size == 0 {
+        let item = if self.task.lock_size == 0 {
             self.upload_empty().await?
         } else {
             let (sess, next_pos) = self.get_or_create_session().await?;
@@ -380,7 +379,7 @@ impl Upload {
 
         log::debug!(
             "Finished uploading {} bytes of {:?}, remote: {}, id: {:?}",
-            size,
+            self.task.lock_size,
             self.task.src_path.display(),
             self.task.remote_path,
             item.id,
@@ -394,7 +393,7 @@ impl Upload {
 
     fn set_fs_time(&self, patch: &mut DriveItem) {
         patch.file_system_info = Some(Box::new(serde_json::json!({
-            "lastModifiedDateTime": humantime::format_rfc3339_nanos(self.task.lock_mtime.unwrap()).to_string(),
+            "lastModifiedDateTime": self.task.lock_mtime.to_string(),
         })));
     }
 
@@ -407,29 +406,20 @@ impl Upload {
         let meta = file.metadata().await?;
 
         let size = meta.len();
-        let mtime = meta.modified()?;
-        match (self.task.lock_size, self.task.lock_mtime) {
-            (Some(lock_size), Some(lock_mtime)) => {
-                log::debug!(
-                    "Previous locked size: {}, mtime: {:?}",
-                    lock_size,
-                    lock_mtime
-                );
-                ensure!(
-                    size == lock_size && mtime == lock_mtime,
-                    "File size or mtime changed since last partial upload. Previous size: {}, previous mtime: {}",
-                    lock_size,
-                    humantime::format_rfc3339_nanos(lock_mtime),
-                );
-            }
-            (None, None) => {
-                log::debug!("Lock at size: {}, mtime: {:?}", size, mtime);
-                self.task.lock_size = Some(size);
-                self.task.lock_mtime = Some(mtime);
-                self.persist_state().await?;
-            }
-            _ => unreachable!(),
-        }
+        let mtime = Time::from(meta.modified()?);
+        log::debug!(
+            "Previous locked size: {}, mtime: {:?}",
+            self.task.lock_size,
+            self.task.lock_mtime,
+        );
+        ensure!(
+            size == self.task.lock_size && mtime == self.task.lock_mtime,
+            "File changed since last add. Previous size and mtime: {}, {}; current: {}, {}",
+            self.task.lock_size,
+            self.task.lock_mtime,
+            size,
+            mtime,
+        );
 
         Ok(file)
     }
@@ -511,7 +501,7 @@ impl Upload {
         sess: UploadSession,
         next_pos: u64,
     ) -> Result<DriveItem> {
-        let size = self.task.lock_size.unwrap();
+        let size = self.task.lock_size;
         assert!(next_pos < size);
         if next_pos != 0 {
             file.seek(SeekFrom::Start(next_pos)).await?;

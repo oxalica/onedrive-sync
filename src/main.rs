@@ -162,7 +162,7 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
     let pendings = state.get_pending()?;
     let mut pending_prefix_map = HashMap::new();
     for pending in &pendings {
-        let path = &pending.local_path;
+        let path = pending.local_path();
         assert!(pending_prefix_map
             .insert(path.as_raw_str(), PendingPrefix::ExactPath { pending })
             .is_none());
@@ -170,20 +170,20 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
             match pending_prefix_map
                 .entry(prefix)
                 .or_insert_with(|| PendingPrefix::PrefixPath {
-                    op: Some(pending.op),
+                    op: Some(pending.operation()),
                     pending_count: 0,
                 }) {
                 // Diff::Conflict between directory and file. But there is a deeper file queued.
                 // So we should keep it as directory.
                 p @ PendingPrefix::ExactPath { .. } => {
                     *p = PendingPrefix::PrefixPath {
-                        op: Some(pending.op),
+                        op: Some(pending.operation()),
                         pending_count: 1,
                     };
                 }
                 PendingPrefix::PrefixPath { op, pending_count } => {
                     *pending_count += 1;
-                    if *op != Some(pending.op) {
+                    if *op != Some(pending.operation()) {
                         *op = None;
                     }
                 }
@@ -278,7 +278,7 @@ fn split_diff<'a>(
         }
         // The diff node itself is a queued file.
         Some(PendingPrefix::ExactPath { pending }) => {
-            let op = pending.op;
+            let op = pending.operation();
             out.queued_diffs.push(resolve_conflict(diff, op));
         }
         // The diff node is a directory containing queued files.
@@ -372,25 +372,27 @@ fn add_pending_diff<'a>(
         Strategy::Auto => unreachable!(),
         Strategy::KeepLocal => {
             for diff in diffs {
-                diff.lhs().unwrap().walk(&diff.path(), |node, path| {
-                    if node.is_file() && path_filter(path) {
-                        pendings.push(Pending {
-                            item_id: None,
-                            local_path: path.clone(),
-                            op: PendingOp::Upload,
-                        });
-                    }
-                });
+                diff.lhs()
+                    .unwrap()
+                    .walk(&diff.path(), |node, path| match node {
+                        Tree::File { size, mtime, .. } if path_filter(path) => {
+                            pendings.push(Pending::Upload {
+                                local_path: path.clone(),
+                                lock_size: *size,
+                                lock_mtime: *mtime,
+                            });
+                        }
+                        _ => {}
+                    });
             }
         }
         Strategy::KeepRemote => {
             for diff in diffs {
                 diff.rhs().unwrap().walk(&diff.path(), |node, path| {
                     if node.is_file() && path_filter(path) {
-                        pendings.push(Pending {
-                            item_id: Some(node.item_id().expect("Already from remote").clone()),
+                        pendings.push(Pending::Download {
                             local_path: path.clone(),
-                            op: PendingOp::Download,
+                            item_id: node.item_id().expect("Already from remote").clone(),
                         });
                     }
                 });

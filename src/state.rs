@@ -304,7 +304,7 @@ impl<'de> serde::Deserialize<'de> for OnedrivePath {
 }
 
 /// A wrapper for `SystemTime` to pretty print, serialize and deserialize in RFC3339 format.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Time(SystemTime);
 
 impl From<SystemTime> for Time {
@@ -347,10 +347,31 @@ impl FromSql for Time {
 }
 
 #[derive(Debug)]
-pub struct Pending {
-    pub op: PendingOp,
-    pub item_id: Option<ItemId>,
-    pub local_path: OnedrivePath,
+pub enum Pending {
+    Download {
+        local_path: OnedrivePath,
+        item_id: ItemId,
+    },
+    Upload {
+        local_path: OnedrivePath,
+        lock_size: u64,
+        lock_mtime: Time,
+    },
+}
+
+impl Pending {
+    pub fn local_path(&self) -> &OnedrivePath {
+        match self {
+            Self::Download { local_path, .. } | Self::Upload { local_path, .. } => local_path,
+        }
+    }
+
+    pub fn operation(&self) -> PendingOp {
+        match self {
+            Pending::Download { .. } => PendingOp::Download,
+            Pending::Upload { .. } => PendingOp::Upload,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumString)]
@@ -392,8 +413,8 @@ pub struct UploadTask {
     pub pending_id: i64,
     pub remote_path: OnedrivePath,
     pub src_path: PathBuf,
-    pub lock_size: Option<u64>,
-    pub lock_mtime: Option<SystemTime>,
+    pub lock_size: u64,
+    pub lock_mtime: Time,
     pub session_url: Option<String>,
 }
 
@@ -619,20 +640,42 @@ impl State {
             let mut stmt_ins = txn.prepare(
                 r"
                     INSERT OR REPLACE INTO `pending`
-                        (`item_id`, `local_path`, `operation`)
+                        (`operation`, `local_path`, `item_id`, `lock_size`, `lock_mtime`)
                         VALUES
-                        (:item_id, :local_path, :operation)
+                        (:operation, :local_path, :item_id, :lock_size, :lock_mtime)
                 ",
             )?;
             for pending in pendings {
                 stmt_del.execute(named_params! {
-                    ":prefix": pending.local_path
+                    ":prefix": pending.local_path(),
                 })?;
-                stmt_ins.insert(named_params! {
-                    ":item_id": pending.item_id.as_ref().map(|id| &id.0),
-                    ":local_path": pending.local_path,
-                    ":operation": pending.op,
-                })?;
+                match pending {
+                    Pending::Download {
+                        local_path,
+                        item_id,
+                    } => {
+                        stmt_ins.insert(named_params! {
+                            ":operation": PendingOp::Download,
+                            ":local_path": local_path,
+                            ":item_id": item_id.0,
+                            ":lock_size": Null,
+                            ":lock_mtime": Null,
+                        })?;
+                    }
+                    Pending::Upload {
+                        local_path,
+                        lock_size,
+                        lock_mtime,
+                    } => {
+                        stmt_ins.insert(named_params! {
+                            ":operation": PendingOp::Upload,
+                            ":local_path": local_path,
+                            ":item_id": Null,
+                            ":lock_size": lock_size,
+                            ":lock_mtime": lock_mtime,
+                        })?;
+                    }
+                }
             }
         }
         txn.commit()?;
@@ -657,12 +700,16 @@ impl State {
     pub fn get_pending(&self) -> Result<Vec<Pending>> {
         self.conn
             .prepare(r"SELECT * FROM `pending`")?
-            .query_and_then([], |row| {
-                Ok(Pending {
-                    item_id: row.get::<_, Option<String>>("item_id")?.map(ItemId),
+            .query_and_then([], |row| match row.get::<_, PendingOp>("operation")? {
+                PendingOp::Download => Ok(Pending::Download {
                     local_path: row.get("local_path")?,
-                    op: row.get("operation")?,
-                })
+                    item_id: ItemId(row.get("item_id")?),
+                }),
+                PendingOp::Upload => Ok(Pending::Upload {
+                    local_path: row.get("local_path")?,
+                    lock_size: row.get("lock_size")?,
+                    lock_mtime: row.get("lock_mtime")?,
+                }),
             })?
             .collect()
     }
@@ -740,29 +787,24 @@ impl State {
                     remote_path: self.config.onedrive.remote_path.join(&local_path),
                     src_path: local_path.root_at(&self.root_dir),
                     lock_size: row.get("lock_size")?,
-                    lock_mtime: row
-                        .get::<_, Option<String>>("lock_mtime")?
-                        .map(|tm| humantime::parse_rfc3339(&tm))
-                        .transpose()?,
+                    lock_mtime: row.get("lock_mtime")?,
                     session_url: row.get("session_url")?,
                 })
             })?
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Save `url`, `current_size` for a running download.
+    /// Save `session_url` for a running download.
     pub fn save_upload_state(&mut self, task: &UploadTask) -> Result<()> {
         self.conn.execute(
             r"
                 INSERT OR REPLACE INTO `upload`
-                    (`pending_id`, `lock_size`, `lock_mtime`, `session_url`)
+                    (`pending_id`, `session_url`)
                     VALUES
-                    (:pending_id, :lock_size, :lock_mtime, :session_url)
+                    (:pending_id, :session_url)
             ",
             named_params! {
                 ":pending_id": task.pending_id,
-                ":lock_size": task.lock_size,
-                ":lock_mtime": task.lock_mtime.map(|tm| humantime::format_rfc3339_nanos(tm).to_string()),
                 ":session_url": task.session_url,
             },
         )?;
