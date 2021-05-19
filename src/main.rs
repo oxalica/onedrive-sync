@@ -171,18 +171,15 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
                 .entry(prefix)
                 .or_insert_with(|| PendingPrefix::PrefixPath {
                     op: Some(pending.operation()),
-                    pending_count: 0,
                 }) {
                 // Diff::Conflict between directory and file. But there is a deeper file queued.
                 // So we should keep it as directory.
                 p @ PendingPrefix::ExactPath { .. } => {
                     *p = PendingPrefix::PrefixPath {
                         op: Some(pending.operation()),
-                        pending_count: 1,
                     };
                 }
-                PendingPrefix::PrefixPath { op, pending_count } => {
-                    *pending_count += 1;
+                PendingPrefix::PrefixPath { op } => {
                     if *op != Some(pending.operation()) {
                         *op = None;
                     }
@@ -194,6 +191,14 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
     let mut status = StatusResult::default();
     for diff in diffs {
         split_diff(diff, &pending_prefix_map, &mut status);
+    }
+
+    if !status.dirty_uploads.is_empty() {
+        println!("Files to be uploaded but changed since the last add:");
+        for (diff, pending) in &status.dirty_uploads {
+            println!("  {}", format_dirty(diff, &local_cwd, pending).yellow());
+        }
+        println!();
     }
 
     if !status.queued_diffs.is_empty() {
@@ -238,6 +243,8 @@ async fn main_status(_: OptStatus, state: State) -> Result<()> {
 struct StatusResult<'a> {
     unqueued_diffs: Vec<Diff<'a>>,
     queued_diffs: Vec<Diff<'a>>,
+    // Files queued to upload but changed since last add.
+    dirty_uploads: Vec<(Diff<'a>, &'a Pending)>,
 }
 
 #[derive(Debug)]
@@ -245,8 +252,6 @@ enum PendingPrefix<'a> {
     PrefixPath {
         /// `Some` if all queued operations are the same. `None` otherwise.
         op: Option<PendingOp>,
-        /// The count of queued operations under this prefix.
-        pending_count: usize,
     },
     ExactPath {
         pending: &'a Pending,
@@ -255,6 +260,7 @@ enum PendingPrefix<'a> {
 
 /// Split `Diff` into queued part and not-queued part.
 /// Maybe recurse into paths when a directory is not fully queued.
+/// Returns if the whole subtree queued and fresh (pending uploads match locked size and mtime).
 fn split_diff<'a>(
     diff: Diff<'a>,
     pending_prefix_map: &HashMap<&str, PendingPrefix<'a>>,
@@ -271,6 +277,24 @@ fn split_diff<'a>(
         }
     }
 
+    fn is_dirty_upload(pending: &Pending, diff: &Diff<'_>) -> bool {
+        match pending {
+            Pending::Upload {
+                lock_size,
+                lock_mtime,
+                ..
+            } => {
+                // TODO: Local files may change.
+                match diff.lhs().expect("Pending upload must has local file") {
+                    Tree::File { size, mtime, .. } => size != lock_size || mtime != lock_mtime,
+                    // TODO: Local files may change.
+                    _ => unreachable!("Pending upload must be a file"),
+                }
+            }
+            _ => false,
+        }
+    }
+
     match pending_prefix_map.get(&diff.path().as_raw_str()) {
         // No queued files is under this diff node.
         None => {
@@ -278,14 +302,17 @@ fn split_diff<'a>(
         }
         // The diff node itself is a queued file.
         Some(PendingPrefix::ExactPath { pending }) => {
+            // Workaroud lifetime issue.
+            let pending = *pending;
             let op = pending.operation();
-            out.queued_diffs.push(resolve_conflict(diff, op));
+            if is_dirty_upload(pending, &diff) {
+                out.dirty_uploads.push((diff, pending));
+            } else {
+                out.queued_diffs.push(resolve_conflict(diff, op));
+            }
         }
         // The diff node is a directory containing queued files.
-        Some(PendingPrefix::PrefixPath { op, pending_count }) => {
-            // Avoid lifetime issue.
-            let pending_count = *pending_count;
-
+        Some(PendingPrefix::PrefixPath { op }) => {
             // In case of directory, `Diff::Conflict` can appears only when
             // there's file on one side and directory on the other side.
             let op = op.expect("No mixed operations under a single diff node");
@@ -301,30 +328,28 @@ fn split_diff<'a>(
                 true => Diff::Right { path, rhs: tree },
             };
 
-            let mut files = 0usize;
-            tree.walk(&OnedrivePath::default(), |node, _| {
-                if node.is_file() {
-                    files += 1;
-                }
-            });
+            let (unqueued, queued, dirty) = (
+                out.unqueued_diffs.len(),
+                out.queued_diffs.len(),
+                out.dirty_uploads.len(),
+            );
 
-            // The whole sub-tree is queued.
-            if files == pending_count {
+            for (name, child) in tree.children().expect("Prefix must be a directory") {
+                path.push(name).unwrap();
+                let sub_diff = make_diff(path.clone(), child);
+                split_diff(sub_diff, pending_prefix_map, out);
+                path.pop();
+            }
+
+            // The whole subtree is queued and fresh. Omit deeper diffs.
+            if out.unqueued_diffs.len() == unqueued && out.dirty_uploads.len() == dirty {
+                out.queued_diffs.truncate(queued);
                 out.queued_diffs.push(make_diff(path, tree));
-            // Some deeper path is not queued. Recurse into children.
-            } else {
-                for (name, child) in tree.children().expect("Prefix must be a directory") {
-                    path.push(name).unwrap();
-                    let sub_diff = make_diff(path.clone(), child);
-                    split_diff(sub_diff, pending_prefix_map, out);
-                    path.pop();
-                }
             }
         }
     }
 }
 
-// FIXME: Print path relative to CWD.
 fn format_diff(diff: &Diff<'_>, cwd: &OnedrivePath) -> String {
     match diff {
         Diff::Left { path, lhs } => {
@@ -339,6 +364,31 @@ fn format_diff(diff: &Diff<'_>, cwd: &OnedrivePath) -> String {
             lhs.calc_attr(),
             rhs.calc_attr(),
         ),
+    }
+}
+
+fn format_dirty(diff: &Diff<'_>, cwd: &OnedrivePath, pending: &Pending) -> String {
+    let tree = diff.lhs().unwrap();
+    match tree {
+        Tree::File { size, mtime, .. } => match pending {
+            Pending::Upload {
+                lock_size,
+                lock_mtime,
+                ..
+            } => {
+                format!(
+                    "local:    {} {} [lock size & mtime: {}, {}] [current: {}, {}]",
+                    diff.path().relative_to(cwd),
+                    tree.calc_attr(),
+                    lock_size,
+                    lock_mtime,
+                    size,
+                    mtime,
+                )
+            }
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
     }
 }
 
@@ -567,7 +617,7 @@ struct OptCommit {
     upload: bool,
 }
 
-// TODO: upload
+// TODO: Check dirty upload first.
 async fn main_commit(opt: OptCommit, state: State) -> Result<()> {
     let (download, upload) = match (opt.download, opt.upload) {
         (false, false) => (true, true),
