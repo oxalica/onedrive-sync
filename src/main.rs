@@ -566,17 +566,12 @@ struct OptCommit {
 }
 
 // TODO: upload
-async fn main_commit(opt: OptCommit, mut state: State) -> Result<()> {
-    let (commit_download, commit_upload) = match (opt.download, opt.upload) {
+async fn main_commit(opt: OptCommit, state: State) -> Result<()> {
+    let (download, upload) = match (opt.download, opt.upload) {
         (false, false) => (true, true),
         o => o,
     };
-    if commit_download {
-        commit::commit_download(&mut state).await?;
-    }
-    if commit_upload {
-        commit::commit_upload(&mut state).await?;
-    }
+    commit::commit(state, download, upload).await?;
     Ok(())
 }
 
