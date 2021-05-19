@@ -1,22 +1,31 @@
 use crate::state::{DownloadTask, State, UploadTask};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
-use futures::{channel::mpsc, SinkExt};
+use colored::Colorize;
+use futures::{channel::mpsc, SinkExt, StreamExt};
 use onedrive_api::{
     option::DriveItemPutOption, resource::DriveItem, ConflictBehavior, ItemLocation, UploadSession,
 };
+use pbr::ProgressBar;
 use reqwest::{header, Client, StatusCode};
 use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     fs::{create_dir_all, rename, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
 };
+
+const PROGRESS_REFRESH_DURATION: Duration = Duration::from_millis(100);
+
+const DOWNLOAD_CONCURRENCY: usize = 4;
 
 // TODO: Concurrently.
 pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
@@ -26,16 +35,62 @@ pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
 
     let client = Client::new();
 
-    if download {
-        println!("{} download task in total", download_tasks.len());
+    if download && !download_tasks.is_empty() {
+        let total_tasks = download_tasks.len();
+        let total_bytes = download_tasks.iter().map(|task| task.size).sum();
+        let progress = Arc::new(Progress {
+            total_tasks,
+            complete_tasks: 0.into(),
+            failed_tasks: 0.into(),
+            complete_bytes: 0.into(),
+        });
+
+        let (err_tx, mut err_rx) = mpsc::channel(1);
+
+        let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
         for task in download_tasks {
             let download = Download {
+                current_pos: 0,
                 task,
                 state: state.clone(),
                 client: client.clone(),
+                progress: progress.clone(),
+                err_tx: err_tx.clone(),
             };
-            tokio::spawn(download.run()).await??;
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                download.run().await
+            });
         }
+
+        // Don't deadlock.
+        drop(err_tx);
+
+        let mut pb = ProgressBar::new(total_bytes);
+        pb.set_units(pbr::Units::Bytes);
+
+        let mut success = true;
+        loop {
+            let running_tasks = DOWNLOAD_CONCURRENCY - semaphore.available_permits();
+            progress.set_bar(&mut pb, running_tasks);
+
+            pb.tick();
+            match tokio::time::timeout(PROGRESS_REFRESH_DURATION, err_rx.next()).await {
+                // Timeout
+                Err(_) => {}
+                // Finished.
+                Ok(None) => break,
+                // A task failed.
+                Ok(Some(err)) => {
+                    success = false;
+                    eprintln!("Task failed: {}", err);
+                }
+            }
+        }
+
+        pb.finish();
+        ensure!(success, "Some tasks failed");
     }
 
     if upload {
@@ -53,10 +108,45 @@ pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     Ok(())
 }
 
+struct Progress {
+    total_tasks: usize,
+    complete_tasks: AtomicUsize,
+    failed_tasks: AtomicU64,
+    complete_bytes: AtomicU64,
+}
+
+impl Progress {
+    fn set_bar<W: std::io::Write>(&self, bar: &mut ProgressBar<W>, running_tasks: usize) {
+        let completed = self.complete_tasks.load(Ordering::Relaxed);
+        let failed = self.failed_tasks.load(Ordering::Relaxed);
+        let bytes = self.complete_bytes.load(Ordering::Relaxed);
+        if failed == 0 {
+            bar.message(&format!(
+                "[{}/{}/{} files] ",
+                running_tasks.to_string().blue(),
+                completed.to_string().green(),
+                self.total_tasks
+            ));
+        } else {
+            bar.message(&format!(
+                "[{}/{}/{} files, {}] ",
+                running_tasks.to_string().blue(),
+                completed.to_string().green(),
+                self.total_tasks,
+                format!("{} failed", failed).red(),
+            ));
+        }
+        bar.set(bytes);
+    }
+}
+
 struct Download {
+    current_pos: u64,
     task: DownloadTask,
     state: Arc<Mutex<State>>,
     client: Client,
+    progress: Arc<Progress>,
+    err_tx: mpsc::Sender<Error>,
 }
 
 impl Download {
@@ -66,7 +156,23 @@ impl Download {
     const MAX_RETRY: usize = 5;
     const RETRY_DELAY: Duration = Duration::from_secs(5);
 
-    async fn run(mut self) -> Result<()> {
+    async fn run(mut self) {
+        match self.run_helper().await {
+            Ok(()) => {
+                assert_eq!(self.current_pos, self.task.size);
+                self.progress.complete_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                let _ = self.err_tx.send(err).await;
+                self.progress.failed_tasks.fetch_add(1, Ordering::Relaxed);
+                self.progress
+                    .complete_bytes
+                    .fetch_add(self.task.size - self.current_pos, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn run_helper(&mut self) -> Result<()> {
         // TODO: Configurable.
         let temp_path = PathBuf::from(".onedrive-sync-temp")
             .join(format!("download.{}.part", self.task.pending_id));
@@ -79,7 +185,7 @@ impl Download {
             temp_path.display(),
         );
 
-        let (file, mut pos) = self.check_open_file(&temp_path).await?;
+        let file = self.check_open_file(&temp_path).await?;
         let mut file = BufWriter::new(file);
 
         // TODO: Retry
@@ -99,7 +205,7 @@ impl Download {
                 }
             }
             match self
-                .download(&mut file, &mut pos, self.task.url.clone().unwrap())
+                .download(&mut file, self.task.url.clone().unwrap())
                 .await
             {
                 Ok(()) => break,
@@ -109,7 +215,7 @@ impl Download {
             tokio::time::sleep(Self::RETRY_DELAY).await;
         }
 
-        ensure!(pos == self.task.size, "Too many retries");
+        ensure!(self.current_pos == self.task.size, "Too many retries");
 
         file.flush().await?;
         drop(file);
@@ -142,11 +248,16 @@ impl Download {
         Ok(())
     }
 
+    fn advance_pos(&mut self, n: u64) {
+        self.current_pos += n;
+        self.progress.complete_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
     async fn persist_state(&self) -> Result<()> {
         self.state.lock().await.save_download_state(&self.task)
     }
 
-    async fn check_open_file(&mut self, temp_path: &Path) -> Result<(File, u64)> {
+    async fn check_open_file(&mut self, temp_path: &Path) -> Result<File> {
         if let Some(prev_pos) = self.task.current_size {
             log::debug!(
                 "Recover from partial download {}/{}",
@@ -158,7 +269,8 @@ impl Download {
             let got_size = file.metadata().await?.len();
             if got_size == self.task.size {
                 file.seek(SeekFrom::Start(prev_pos)).await?;
-                return Ok((file, prev_pos));
+                self.advance_pos(prev_pos);
+                return Ok(file);
             } else {
                 log::warn!(
                     "Temporary file length mismatch: got {}, expect {}. Discard it and re-download from start",
@@ -180,7 +292,7 @@ impl Download {
         file.set_len(self.task.size).await?;
         self.task.current_size = Some(0);
         self.persist_state().await?;
-        Ok((file, 0))
+        Ok(file)
     }
 
     async fn reload_download_url(&mut self) -> Result<()> {
@@ -195,18 +307,13 @@ impl Download {
         Ok(())
     }
 
-    async fn download(
-        &mut self,
-        file: &mut BufWriter<File>,
-        pos: &mut u64,
-        url: String,
-    ) -> Result<()> {
-        assert!(*pos < self.task.size);
+    async fn download(&mut self, file: &mut BufWriter<File>, url: String) -> Result<()> {
+        assert!(self.current_pos < self.task.size);
 
         let mut resp = self
             .client
             .get(url)
-            .header(header::RANGE, format!("bytes={}-", *pos))
+            .header(header::RANGE, format!("bytes={}-", self.current_pos))
             .send()
             .await?;
         ensure!(
@@ -217,26 +324,31 @@ impl Download {
 
         let mut last_save_time = Instant::now();
 
-        while *pos < self.task.size {
+        while self.current_pos < self.task.size {
             let chunk = match tokio::time::timeout(Self::CHUNK_TIMEOUT, resp.chunk()).await {
                 Err(_) => bail!("Timeout"),
                 Ok(Err(err)) => return Err(err.into()),
                 Ok(Ok(None)) => {
-                    bail!("Stream ended at {}, but expecting {}", *pos, self.task.size)
+                    bail!(
+                        "Stream ended at {}, but expecting {}",
+                        self.current_pos,
+                        self.task.size,
+                    )
                 }
                 Ok(Ok(Some(chunk))) => chunk,
             };
 
+            let chunk_len = chunk.len() as u64;
             ensure!(
-                *pos + chunk.len() as u64 <= self.task.size,
-                "Download stream lengh mismatch",
+                self.current_pos + chunk_len <= self.task.size,
+                "Stream length mismatch",
             );
             file.write_all(&*chunk).await?;
-            *pos += chunk.len() as u64;
+            self.advance_pos(chunk_len);
 
             if Self::SAVE_STATE_PERIOD < last_save_time.elapsed() {
                 log::debug!("Download checkpoint");
-                self.task.current_size = Some(*pos - file.buffer().len() as u64);
+                self.task.current_size = Some(self.current_pos - file.buffer().len() as u64);
                 self.persist_state().await?;
                 last_save_time = Instant::now();
             }

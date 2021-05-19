@@ -18,6 +18,7 @@ humantime = "2.1.0"
 log = "0.4.14"
 onedrive-api = "0.8.1"
 open = "1.7.0"
+pbr = "1.0.4"
 reqwest = { version = "0.11.3", features = ["stream"] }
 rusqlite = "0.25.1"
 serde = { version = "1.0.125", features = ["derive"] }
