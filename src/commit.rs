@@ -7,32 +7,38 @@ use onedrive_api::{
 };
 use reqwest::{header, Client, StatusCode};
 use std::{
-    io::{BufWriter, Seek, SeekFrom, Write},
-    path::PathBuf,
+    io::SeekFrom,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    fs::{create_dir_all, rename, File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::Mutex,
 };
 
 // TODO: Concurrently.
-pub async fn commit(mut state: State, download: bool, upload: bool) -> Result<()> {
+pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     let download_tasks = state.get_pending_download()?;
     let upload_tasks = state.get_pending_upload()?;
+    let state = Arc::new(Mutex::new(state));
+
     let client = Client::new();
 
     if download {
         println!("{} download task in total", download_tasks.len());
         for task in download_tasks {
-            download_one(task, &mut state, &client).await?;
+            let download = Download {
+                task,
+                state: state.clone(),
+                client: client.clone(),
+            };
+            tokio::spawn(download.run()).await??;
         }
     }
 
     if upload {
-        let state = Arc::new(Mutex::new(state));
         println!("{} upload task in total", upload_tasks.len());
         // TODO: Create remote directories first.
         for task in upload_tasks {
@@ -47,138 +53,194 @@ pub async fn commit(mut state: State, download: bool, upload: bool) -> Result<()
     Ok(())
 }
 
-async fn download_one(mut task: DownloadTask, state: &mut State, client: &Client) -> Result<()> {
+struct Download {
+    task: DownloadTask,
+    state: Arc<Mutex<State>>,
+    client: Client,
+}
+
+impl Download {
     const CHUNK_TIMEOUT: Duration = Duration::from_secs(10);
     const SAVE_STATE_PERIOD: Duration = Duration::from_secs(5);
 
-    // TODO: Configurable.
-    let temp_file_path =
-        PathBuf::from(".onedrive-sync-temp").join(format!("download.{}.part", task.pending_id));
+    const MAX_RETRY: usize = 5;
+    const RETRY_DELAY: Duration = Duration::from_secs(5);
 
-    log::debug!(
-        "Start downloading {} bytes of {:?}, destination: {}, temp file: {}",
-        task.size,
-        task.item_id,
-        task.dest_path.display(),
-        temp_file_path.display(),
-    );
+    async fn run(mut self) -> Result<()> {
+        // TODO: Configurable.
+        let temp_path = PathBuf::from(".onedrive-sync-temp")
+            .join(format!("download.{}.part", self.task.pending_id));
 
-    let (file, mut pos) = match task.current_size {
-        Some(current_size) => {
+        log::debug!(
+            "Start downloading {} bytes of {:?}, destination: {}, temp file: {}",
+            self.task.size,
+            self.task.item_id,
+            self.task.dest_path.display(),
+            temp_path.display(),
+        );
+
+        let (file, mut pos) = self.check_open_file(&temp_path).await?;
+        let mut file = BufWriter::new(file);
+
+        // TODO: Retry
+        for i in 1..=Self::MAX_RETRY {
+            if i != 1 || self.task.url.is_none() {
+                match self.reload_download_url().await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        log::error!(
+                            "Failed to get download url (try {}/{}): {}",
+                            i,
+                            Self::MAX_RETRY,
+                            err,
+                        );
+                        continue;
+                    }
+                }
+            }
+            match self
+                .download(&mut file, &mut pos, self.task.url.clone().unwrap())
+                .await
+            {
+                Ok(()) => break,
+                Err(err) if err.is::<std::io::Error>() => bail!("Unrecoverable IO error: {}", err),
+                Err(err) => log::error!("Download error (try {}/{}): {}", i, Self::MAX_RETRY, err),
+            }
+            tokio::time::sleep(Self::RETRY_DELAY).await;
+        }
+
+        ensure!(pos == self.task.size, "Too many retries");
+
+        log::debug!(
+            "Finished downloading {} bytes of {:?}, destination: {}",
+            self.task.size,
+            self.task.item_id,
+            self.task.dest_path.display(),
+        );
+
+        // TODO: atime?
+        filetime::set_file_mtime(&temp_path, self.task.remote_mtime.into())?;
+        if let Some(parent) = self.task.dest_path.parent() {
+            create_dir_all(parent).await?;
+        }
+        // TODO: No replace.
+        rename(&temp_path, &self.task.dest_path).await?;
+
+        self.state
+            .lock()
+            .await
+            .finish_download(self.task.pending_id)?;
+        log::debug!(
+            "Recovered mtime and placed {:?} to {}",
+            self.task.item_id,
+            self.task.dest_path.display(),
+        );
+
+        Ok(())
+    }
+
+    async fn persist_state(&self) -> Result<()> {
+        self.state.lock().await.save_download_state(&self.task)
+    }
+
+    async fn check_open_file(&mut self, temp_path: &Path) -> Result<(File, u64)> {
+        if let Some(prev_pos) = self.task.current_size {
             log::debug!(
                 "Recover from partial download {}/{}",
-                current_size,
-                task.size
+                prev_pos,
+                self.task.size
             );
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&temp_file_path)?;
-            assert_eq!(file.metadata()?.len(), task.size);
-            assert!(current_size <= task.size);
-            file.seek(SeekFrom::Start(current_size))?;
-            (file, current_size)
-        }
-        None => {
-            log::debug!("Fresh download");
-            if let Some(parent) = temp_file_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            assert!(prev_pos <= self.task.size);
+            let mut file = OpenOptions::new().write(true).open(&temp_path).await?;
+            let got_size = file.metadata().await?.len();
+            if got_size == self.task.size {
+                file.seek(SeekFrom::Start(prev_pos)).await?;
+                return Ok((file, prev_pos));
+            } else {
+                log::warn!(
+                    "Temporary file length mismatch: got {}, expect {}. Discard it and re-download from start",
+                    got_size,
+                    self.task.size,
+                );
             }
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_file_path)?;
-            file.set_len(task.size)?;
-            task.current_size = Some(0);
-            state.save_download_state(&task)?;
-            (file, 0)
         }
-    };
 
-    let mut file = BufWriter::new(file);
-    let mut last_save_time = Instant::now();
+        log::debug!("Fresh download");
+        if let Some(parent) = temp_path.parent() {
+            create_dir_all(parent).await?;
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        file.set_len(self.task.size).await?;
+        self.task.current_size = Some(0);
+        self.persist_state().await?;
+        Ok((file, 0))
+    }
 
-    while pos < task.size {
-        let url = match &task.url {
-            // FIXME: URL may expire.
-            Some(url) => url.clone(),
-            None => {
-                let onedrive = state.get_or_login().await?;
-                let url = onedrive
-                    .get_item_download_url(ItemLocation::from_id(&task.item_id))
-                    .await?;
-                task.url = Some(url.clone());
-                state.save_download_state(&task)?;
-                url
-            }
-        };
+    async fn reload_download_url(&mut self) -> Result<()> {
+        log::debug!("Fetching download url");
+        let onedrive = self.state.lock().await.get_or_login().await?;
+        let url = onedrive
+            .get_item_download_url(ItemLocation::from_id(&self.task.item_id))
+            .await?;
+        log::debug!("Got download url: {}", url);
+        self.task.url = Some(url);
+        self.persist_state().await?;
+        Ok(())
+    }
 
-        // TODO: Retry.
-        let mut resp = client
-            .get(&url)
-            .header(header::RANGE, format!("bytes={}-", pos))
+    async fn download(
+        &mut self,
+        file: &mut BufWriter<File>,
+        pos: &mut u64,
+        url: String,
+    ) -> Result<()> {
+        assert!(*pos < self.task.size);
+
+        let mut resp = self
+            .client
+            .get(url)
+            .header(header::RANGE, format!("bytes={}-", *pos))
             .send()
             .await?;
         ensure!(
             resp.status() == StatusCode::PARTIAL_CONTENT,
             "Not Partial Content response: {}",
-            resp.status()
+            resp.status(),
         );
 
-        loop {
-            let chunk = match tokio::time::timeout(CHUNK_TIMEOUT, resp.chunk()).await {
-                Err(_) => {
-                    log::error!("Download stream timeout");
-                    break;
-                }
-                Ok(Err(err)) => {
-                    log::error!("Download stream error: {}", err);
-                    break;
-                }
+        let mut last_save_time = Instant::now();
+
+        while *pos < self.task.size {
+            let chunk = match tokio::time::timeout(Self::CHUNK_TIMEOUT, resp.chunk()).await {
+                Err(_) => bail!("Timeout"),
+                Ok(Err(err)) => return Err(err.into()),
                 Ok(Ok(None)) => {
-                    ensure!(pos == task.size, "Download stream ends too early");
-                    break;
+                    bail!("Stream ended at {}, but expecting {}", *pos, self.task.size)
                 }
                 Ok(Ok(Some(chunk))) => chunk,
             };
 
-            file.write_all(&*chunk)?;
-            assert!(pos + chunk.len() as u64 <= task.size);
-            pos += chunk.len() as u64;
+            ensure!(
+                *pos + chunk.len() as u64 <= self.task.size,
+                "Download stream lengh mismatch",
+            );
+            file.write_all(&*chunk).await?;
+            *pos += chunk.len() as u64;
 
-            if SAVE_STATE_PERIOD < last_save_time.elapsed() {
-                log::trace!("Download checkpoint");
-                task.current_size = Some(pos - file.buffer().len() as u64);
-                state.save_download_state(&task)?;
+            if Self::SAVE_STATE_PERIOD < last_save_time.elapsed() {
+                log::debug!("Download checkpoint");
+                self.task.current_size = Some(*pos - file.buffer().len() as u64);
+                self.persist_state().await?;
                 last_save_time = Instant::now();
             }
         }
+
+        Ok(())
     }
-
-    file.flush()?;
-    assert_eq!(pos, task.size);
-    log::debug!(
-        "Finished downloading {} bytes of {:?}, destination: {}",
-        task.size,
-        task.item_id,
-        task.dest_path.display(),
-    );
-
-    // TODO: atime?
-    filetime::set_file_mtime(&temp_file_path, task.remote_mtime.into())?;
-    if let Some(parent) = task.dest_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // TODO: No replace.
-    std::fs::rename(&temp_file_path, &task.dest_path)?;
-
-    state.finish_download(task.pending_id)?;
-    log::debug!(
-        "Recovered mtime and placed {:?} to {}",
-        task.item_id,
-        task.dest_path.display(),
-    );
-
-    Ok(())
 }
 
 struct Upload {
@@ -307,26 +369,26 @@ impl Upload {
             }
         }
 
-                log::debug!("Creating upload session");
+        log::debug!("Creating upload session");
 
-                let mut initial = DriveItem::default();
-                self.set_fs_time(&mut initial);
+        let mut initial = DriveItem::default();
+        self.set_fs_time(&mut initial);
 
-                let onedrive = self.state.lock().await.get_or_login().await?;
-                // TODO: Save expiration time?
-                let (sess, _meta) = onedrive
-                    .new_upload_session_with_initial_option(
-                        ItemLocation::from_path(self.task.remote_path.as_raw_str())
-                            .context("Invalid remote path")?,
-                        &initial,
-                        // FIXME: Also use ctag?
-                        DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace),
-                    )
-                    .await?;
-                self.task.session_url = Some(sess.upload_url().to_owned());
-                self.persist_state().await?;
-                Ok((sess, 0))
-            }
+        let onedrive = self.state.lock().await.get_or_login().await?;
+        // TODO: Save expiration time?
+        let (sess, _meta) = onedrive
+            .new_upload_session_with_initial_option(
+                ItemLocation::from_path(self.task.remote_path.as_raw_str())
+                    .context("Invalid remote path")?,
+                &initial,
+                // FIXME: Also use ctag?
+                DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace),
+            )
+            .await?;
+        self.task.session_url = Some(sess.upload_url().to_owned());
+        self.persist_state().await?;
+        Ok((sess, 0))
+    }
 
     async fn upload_with_session(
         &mut self,
