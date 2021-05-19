@@ -111,6 +111,9 @@ impl Download {
 
         ensure!(pos == self.task.size, "Too many retries");
 
+        file.flush().await?;
+        drop(file);
+
         log::debug!(
             "Finished downloading {} bytes of {:?}, destination: {}",
             self.task.size,
