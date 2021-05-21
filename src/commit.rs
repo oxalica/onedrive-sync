@@ -31,6 +31,21 @@ const DOWNLOAD_CONCURRENCY: usize = 4;
 pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     let download_tasks = state.get_pending_download()?;
     let upload_tasks = state.get_pending_upload()?;
+
+    if upload {
+        for task in &upload_tasks {
+            let meta = task.src_path.metadata()?;
+            let (size, mtime) = (meta.len(), Time::from(meta.modified()?));
+            ensure!(
+                task.lock_size == size && task.lock_mtime == mtime,
+                "File to be upload changed since last add: {}, lock size & mtime: {}, {}, current: {}, {}",
+                task.src_path.display(),
+                task.lock_size, task.lock_mtime,
+                size, mtime,
+            );
+        }
+    }
+
     let state = Arc::new(Mutex::new(state));
 
     let client = Client::new();
