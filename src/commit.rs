@@ -347,36 +347,48 @@ impl Download {
         let file = self.check_open_file(&temp_path).await?;
         let mut file = BufWriter::new(file);
 
-        // TODO: Retry
-        for i in 1..=Self::MAX_RETRY {
-            if i != 1 || self.task.url.is_none() {
-                match self.reload_download_url().await {
-                    Ok(()) => {}
-                    Err(err) => {
-                        log::error!(
-                            "Failed to get download url (try {}/{}): {}",
-                            i,
-                            Self::MAX_RETRY,
-                            err,
-                        );
-                        continue;
+        // File may already be downloaded, but failed to move to destination in the last time.
+        if self.current_pos != self.task.size {
+            for i in 1..=Self::MAX_RETRY {
+                if i != 1 || self.task.url.is_none() {
+                    match self.reload_download_url().await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            log::error!(
+                                "Failed to get download url (try {}/{}): {}",
+                                i,
+                                Self::MAX_RETRY,
+                                err,
+                            );
+                            continue;
+                        }
                     }
                 }
+
+                let ret = self
+                    .download(&mut file, self.task.url.clone().unwrap())
+                    .await;
+
+                // Always flush when download finished or failed.
+                file.flush().await?;
+                file.get_mut().sync_data().await?;
+                self.task.current_size = Some(self.current_pos);
+                self.persist_state().await?;
+
+                match ret {
+                    Ok(()) => break,
+                    Err(err) if err.is::<std::io::Error>() => {
+                        bail!("Unrecoverable IO error: {}", err)
+                    }
+                    Err(err) => {
+                        log::error!("Download error (try {}/{}): {}", i, Self::MAX_RETRY, err)
+                    }
+                }
+                tokio::time::sleep(Self::RETRY_DELAY).await;
             }
-            match self
-                .download(&mut file, self.task.url.clone().unwrap())
-                .await
-            {
-                Ok(()) => break,
-                Err(err) if err.is::<std::io::Error>() => bail!("Unrecoverable IO error: {}", err),
-                Err(err) => log::error!("Download error (try {}/{}): {}", i, Self::MAX_RETRY, err),
-            }
-            tokio::time::sleep(Self::RETRY_DELAY).await;
+            ensure!(self.current_pos == self.task.size, "Too many retries");
         }
 
-        ensure!(self.current_pos == self.task.size, "Too many retries");
-
-        file.flush().await?;
         drop(file);
 
         log::debug!(
