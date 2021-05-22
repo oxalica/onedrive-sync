@@ -11,6 +11,7 @@ use crate::tree::Tree;
 
 mod commit;
 mod config;
+mod logger;
 mod state;
 mod tree;
 
@@ -34,7 +35,7 @@ enum Opt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    logger::Logger::init();
 
     let state = State::new(".", &default_state_file())?;
 

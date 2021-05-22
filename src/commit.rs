@@ -1,4 +1,3 @@
-// TODO: Make `log` work properly with `indicatif`.
 use crate::state::{DownloadTask, State, Time, UploadTask};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
@@ -79,11 +78,23 @@ pub async fn commit(state: State, download: bool, upload: bool, show_progress: b
         upload_progress = Some(progress);
     }
 
-    multi_bar.join()?;
+    let all_progress = download_progress.iter().chain(&upload_progress);
 
-    let failed = download_progress
-        .iter()
-        .chain(&upload_progress)
+    {
+        let _log_redirect_guard = match all_progress.clone().next() {
+            None => return Ok(()),
+            Some(prog) if show_progress => Some(
+                crate::logger::LOGGER
+                    .get()
+                    .unwrap()
+                    .attach_to(prog.bar.clone()),
+            ),
+            Some(_) => None,
+        };
+        multi_bar.join()?;
+    }
+
+    let failed = all_progress
         .map(|progress| progress.failed_tasks.load(Ordering::Relaxed))
         .sum::<usize>();
     ensure!(failed == 0, "{} tasks failed", failed);
@@ -200,36 +211,37 @@ impl Progress {
     }
 
     fn task_complete(&self, msg: String) {
-        self.running_tasks.fetch_sub(1, Ordering::Relaxed);
-        self.complete_tasks.fetch_add(1, Ordering::Relaxed);
         if self.show_progress {
             log::debug!("{}", msg);
         } else {
             log::info!("{}", msg);
         }
+        // Print before finish.
+        self.complete_tasks.fetch_add(1, Ordering::Release);
+
+        self.running_tasks.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn task_fail(&self, msg: String, skipped: u64, current: u64, total: u64) {
+        log::error!("{}", msg);
+        // Print before finish.
+        self.failed_tasks.fetch_add(1, Ordering::Release);
+
         self.running_tasks.fetch_sub(1, Ordering::Relaxed);
-        self.failed_tasks.fetch_add(1, Ordering::Relaxed);
         self.complete_bytes
             .fetch_sub(current - skipped, Ordering::Relaxed);
         self.total_bytes
             .fetch_sub(total - skipped, Ordering::Relaxed);
-        if self.show_progress {
-            log::debug!("{}", msg);
-            self.bar.println(msg);
-        } else {
-            log::error!("{}", msg);
-        }
         self.bar.reset_eta();
     }
 
     // Upload progress bar and return `false` if finished.
     fn update_bar(&self, msg: &str) -> bool {
+        // Make println to be emitted before `finish`.
+        let completed = self.complete_tasks.load(Ordering::Acquire);
+        let failed = self.failed_tasks.load(Ordering::Acquire);
+
         let running = self.running_tasks.load(Ordering::Relaxed);
-        let completed = self.complete_tasks.load(Ordering::Relaxed);
-        let failed = self.failed_tasks.load(Ordering::Relaxed);
         let bytes = self.complete_bytes.load(Ordering::Relaxed);
         let total_bytes = self.total_bytes.load(Ordering::Relaxed);
         if failed == 0 {
