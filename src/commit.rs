@@ -1,6 +1,6 @@
 // TODO: Make `log` work properly with `indicatif`.
 use crate::state::{DownloadTask, State, Time, UploadTask};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
 use colored::Colorize;
 use futures::{channel::mpsc, SinkExt, StreamExt};
@@ -399,18 +399,30 @@ impl Download {
                 self.task.size
             );
             assert!(prev_pos <= self.task.size);
-            let mut file = OpenOptions::new().write(true).open(&temp_path).await?;
-            let got_size = file.metadata().await?.len();
-            if got_size == self.task.size {
-                file.seek(SeekFrom::Start(prev_pos)).await?;
-                self.advance_pos(prev_pos, true);
-                return Ok(file);
-            } else {
-                log::warn!(
-                    "Temporary file length mismatch: got {}, expect {}. Discard it and re-download from start",
-                    got_size,
-                    self.task.size,
-                );
+            match OpenOptions::new().write(true).open(&temp_path).await {
+                Ok(mut file) => {
+                    let got_size = file.metadata().await?.len();
+                    if got_size == self.task.size {
+                        file.seek(SeekFrom::Start(prev_pos)).await?;
+                        self.advance_pos(prev_pos, true);
+                        return Ok(file);
+                    } else {
+                        log::warn!(
+                            "Temporary file length mismatch: got {}, expect {}. Discard it and re-download from start",
+                            got_size,
+                            self.task.size,
+                        );
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    log::warn!("Temporary file missing. Re-download from start");
+                }
+                Err(err) => {
+                    return Err(Error::from(err).context(format!(
+                        "Failed open temporary file {}",
+                        temp_path.display()
+                    )))
+                }
             }
         }
 
