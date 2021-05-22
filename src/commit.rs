@@ -103,13 +103,7 @@ fn start_download_tasks(
 
     let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
     for task in tasks {
-        let download = Download {
-            current_pos: 0,
-            task,
-            state: state.clone(),
-            client: client.clone(),
-            progress: progress.clone(),
-        };
+        let download = Download::new(task, state.clone(), client.clone(), progress.clone());
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
@@ -139,13 +133,7 @@ fn start_upload_tasks(
     // TODO: Create remote directories first.
     let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
     for task in tasks {
-        let upload = Upload {
-            task,
-            state: state.clone(),
-            client: client.clone(),
-            progress: progress.clone(),
-            uploaded_bytes: Arc::new(0.into()),
-        };
+        let upload = Upload::new(task, state.clone(), client.clone(), progress.clone());
         let semaphore = semaphore.clone();
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
@@ -191,13 +179,15 @@ impl Progress {
         }
     }
 
-    fn advance(&self, bytes: u64, jump: bool) {
+    // Skip bytes already done. This decrease the total bytes.
+    fn skip(&self, bytes: u64) {
+        self.total_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.bar.reset_eta();
+    }
+
+    // Advance progress.
+    fn advance(&self, bytes: u64) {
         self.complete_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if jump {
-            log::debug!("Reset ETA");
-            self.bar.reset_eta();
-            self.bar.reset_elapsed();
-        }
     }
 
     fn task_start(&self, msg: String) {
@@ -219,11 +209,13 @@ impl Progress {
         }
     }
 
-    fn task_fail(&self, msg: String, current: u64, total: u64) {
+    fn task_fail(&self, msg: String, skipped: u64, current: u64, total: u64) {
         self.running_tasks.fetch_sub(1, Ordering::Relaxed);
         self.failed_tasks.fetch_add(1, Ordering::Relaxed);
-        self.complete_bytes.fetch_sub(current, Ordering::Relaxed);
-        self.total_bytes.fetch_sub(total, Ordering::Relaxed);
+        self.complete_bytes
+            .fetch_sub(current - skipped, Ordering::Relaxed);
+        self.total_bytes
+            .fetch_sub(total - skipped, Ordering::Relaxed);
         if self.show_progress {
             log::debug!("{}", msg);
             self.bar.println(msg);
@@ -231,7 +223,6 @@ impl Progress {
             log::error!("{}", msg);
         }
         self.bar.reset_eta();
-        self.bar.reset_elapsed();
     }
 
     // Upload progress bar and return `false` if finished.
@@ -260,6 +251,7 @@ impl Progress {
             ));
         }
         self.bar.set_position(bytes);
+        self.bar.set_length(total_bytes);
         let finished = self.total_tasks == completed + failed && total_bytes == bytes;
         if finished {
             self.bar.finish();
@@ -269,6 +261,7 @@ impl Progress {
 }
 
 struct Download {
+    start_pos: u64,
     current_pos: u64,
     task: DownloadTask,
     state: Arc<Mutex<State>>,
@@ -282,6 +275,22 @@ impl Download {
 
     const MAX_RETRY: usize = 5;
     const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+    fn new(
+        task: DownloadTask,
+        state: Arc<Mutex<State>>,
+        client: Client,
+        progress: Arc<Progress>,
+    ) -> Self {
+        Self {
+            start_pos: 0,
+            current_pos: 0,
+            task,
+            state,
+            client,
+            progress,
+        }
+    }
 
     async fn run(mut self) {
         self.progress
@@ -299,6 +308,7 @@ impl Download {
                         self.task.dest_path.display(),
                         err,
                     ),
+                    self.start_pos,
                     self.current_pos,
                     self.task.size,
                 );
@@ -382,11 +392,6 @@ impl Download {
         Ok(())
     }
 
-    fn advance_pos(&mut self, n: u64, jump: bool) {
-        self.current_pos += n;
-        self.progress.advance(n, jump);
-    }
-
     async fn persist_state(&self) -> Result<()> {
         self.state.lock().await.save_download_state(&self.task)
     }
@@ -404,7 +409,9 @@ impl Download {
                     let got_size = file.metadata().await?.len();
                     if got_size == self.task.size {
                         file.seek(SeekFrom::Start(prev_pos)).await?;
-                        self.advance_pos(prev_pos, true);
+                        self.start_pos = prev_pos;
+                        self.current_pos = prev_pos;
+                        self.progress.skip(prev_pos);
                         return Ok(file);
                     } else {
                         log::warn!(
@@ -490,7 +497,8 @@ impl Download {
                 "Stream length mismatch",
             );
             file.write_all(&*chunk).await?;
-            self.advance_pos(chunk_len, false);
+            self.current_pos += chunk_len;
+            self.progress.advance(chunk_len);
 
             if Self::SAVE_STATE_PERIOD < last_save_time.elapsed() {
                 log::debug!("Download checkpoint");
@@ -510,10 +518,27 @@ struct Upload {
     client: Client,
     progress: Arc<Progress>,
     uploaded_bytes: Arc<AtomicU64>,
+    start_pos: u64,
 }
 
 impl Upload {
     const UPLOAD_PART_SIZE: usize = 64 << 20; // 64 MiB
+
+    fn new(
+        task: UploadTask,
+        state: Arc<Mutex<State>>,
+        client: Client,
+        progress: Arc<Progress>,
+    ) -> Self {
+        Self {
+            task,
+            state,
+            client,
+            progress,
+            uploaded_bytes: Arc::new(0.into()),
+            start_pos: 0,
+        }
+    }
 
     async fn run(mut self) {
         self.progress
@@ -529,10 +554,15 @@ impl Upload {
                     self.task.src_path.display(),
                     err,
                 );
-                let current = Arc::try_unwrap(self.uploaded_bytes)
+                let uploaded = Arc::try_unwrap(self.uploaded_bytes)
                     .expect("Upload request must be finished")
                     .into_inner();
-                self.progress.task_fail(msg, current, self.task.lock_size);
+                self.progress.task_fail(
+                    msg,
+                    self.start_pos,
+                    self.start_pos + uploaded,
+                    self.task.lock_size,
+                );
             }
         }
     }
@@ -544,9 +574,9 @@ impl Upload {
             self.upload_empty().await?
         } else {
             let (sess, next_pos) = self.get_or_create_session().await?;
-            self.uploaded_bytes.fetch_add(next_pos, Ordering::Relaxed);
-            self.progress.advance(next_pos, true);
-            self.upload_with_session(file, sess, next_pos).await?
+            self.start_pos = next_pos;
+            self.progress.skip(next_pos);
+            self.upload_with_session(file, sess).await?
         };
 
         log::debug!(
@@ -671,18 +701,17 @@ impl Upload {
         &mut self,
         mut file: File,
         sess: UploadSession,
-        next_pos: u64,
     ) -> Result<DriveItem> {
         let size = self.task.lock_size;
-        assert!(next_pos < size);
-        if next_pos != 0 {
-            file.seek(SeekFrom::Start(next_pos)).await?;
+        assert!(self.start_pos < size);
+        if self.start_pos != 0 {
+            file.seek(SeekFrom::Start(self.start_pos)).await?;
         }
 
         let mut file_stream = FileReadStream::new(file);
         let mut item = None;
 
-        for chunk_start in (next_pos..size).step_by(Self::UPLOAD_PART_SIZE) {
+        for chunk_start in (self.start_pos..size).step_by(Self::UPLOAD_PART_SIZE) {
             let chunk_end = chunk_start
                 .saturating_add(Self::UPLOAD_PART_SIZE as u64)
                 .min(size);
@@ -698,7 +727,7 @@ impl Upload {
                 let len = chunk.as_ref().map_or(0, |bytes| bytes.len()) as u64;
                 log::trace!("Upload {} bytes", len);
                 uploaded_bytes.fetch_add(len, Ordering::Relaxed);
-                progress.advance(len, false);
+                progress.advance(len);
             });
 
             let stream_fut = file_stream.stream_to(tx, chunk_len as u64);
