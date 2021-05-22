@@ -124,7 +124,7 @@ fn start_download_tasks(
 
     let progress2 = progress.clone();
     tokio::spawn(async move {
-        while progress2.update_bar("Download") {
+        while progress2.update_bar("Downloading", "Download finished") {
             tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
         }
     });
@@ -155,7 +155,7 @@ fn start_upload_tasks(
     let progress2 = progress.clone();
     if show_progress {
         tokio::spawn(async move {
-            while progress2.update_bar("Upload  ") {
+            while progress2.update_bar("  Uploading", "  Upload finished") {
                 tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
             }
         });
@@ -236,7 +236,7 @@ impl Progress {
     }
 
     // Upload progress bar and return `false` if finished.
-    fn update_bar(&self, msg: &str) -> bool {
+    fn update_bar(&self, msg_running: &str, msg_done: &str) -> bool {
         // Make println to be emitted before `finish`.
         let completed = self.complete_tasks.load(Ordering::Acquire);
         let failed = self.failed_tasks.load(Ordering::Acquire);
@@ -244,6 +244,10 @@ impl Progress {
         let running = self.running_tasks.load(Ordering::Relaxed);
         let bytes = self.complete_bytes.load(Ordering::Relaxed);
         let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+
+        let finished = self.total_tasks == completed + failed && total_bytes == bytes;
+        let msg = if finished { msg_done } else { msg_running };
+
         if failed == 0 {
             self.bar.set_message(format!(
                 "{} [{}/{}/{} files]",
@@ -264,7 +268,6 @@ impl Progress {
         }
         self.bar.set_position(bytes);
         self.bar.set_length(total_bytes);
-        let finished = self.total_tasks == completed + failed && total_bytes == bytes;
         if finished {
             self.bar.finish();
         }
