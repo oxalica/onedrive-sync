@@ -1,9 +1,10 @@
+// TODO: Make `log` work properly with `indicatif`.
 use crate::state::{DownloadTask, State, Time, UploadTask};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use colored::Colorize;
 use futures::{channel::mpsc, SinkExt, StreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use onedrive_api::{
     option::DriveItemPutOption, resource::DriveItem, ConflictBehavior, ItemLocation, UploadSession,
 };
@@ -23,7 +24,8 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
-const PROGRESS_REFRESH_DURATION: Duration = Duration::from_millis(100);
+// 15 Hz to match `indicatif`'s default.
+const PROGRESS_REFRESH_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 15);
 
 const DOWNLOAD_CONCURRENCY: usize = 4;
 const UPLOAD_CONCURRENCY: usize = 4;
@@ -34,7 +36,7 @@ fn progress_style() -> ProgressStyle {
         .progress_chars("=>-")
 }
 
-pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
+pub async fn commit(state: State, download: bool, upload: bool, show_progress: bool) -> Result<()> {
     let download_tasks = state.get_pending_download()?;
     let upload_tasks = state.get_pending_upload()?;
 
@@ -56,15 +58,23 @@ pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     let state = Arc::new(Mutex::new(state));
     let client = Client::new();
 
-    let multi_bar = MultiProgress::new();
+    let draw_target = if show_progress {
+        ProgressDrawTarget::stderr()
+    } else {
+        ProgressDrawTarget::hidden()
+    };
+    let multi_bar = MultiProgress::with_draw_target(draw_target);
+
     let (mut download_progress, mut upload_progress) = (None, None);
     if download && !download_tasks.is_empty() {
-        let progress = start_download_tasks(download_tasks, state.clone(), client.clone());
+        let progress =
+            start_download_tasks(download_tasks, state.clone(), client.clone(), show_progress);
         multi_bar.add(progress.bar.clone());
         download_progress = Some(progress);
     }
     if upload && !upload_tasks.is_empty() {
-        let progress = start_upload_tasks(upload_tasks, state.clone(), client.clone());
+        let progress =
+            start_upload_tasks(upload_tasks, state.clone(), client.clone(), show_progress);
         multi_bar.add(progress.bar.clone());
         upload_progress = Some(progress);
     }
@@ -85,10 +95,11 @@ fn start_download_tasks(
     tasks: Vec<DownloadTask>,
     state: Arc<Mutex<State>>,
     client: Client,
+    show_progress: bool,
 ) -> Arc<Progress> {
     let total_tasks = tasks.len();
     let total_bytes = tasks.iter().map(|task| task.size).sum();
-    let progress = Arc::new(Progress::new(total_tasks, total_bytes));
+    let progress = Arc::new(Progress::new(total_tasks, total_bytes, show_progress));
 
     let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
     for task in tasks {
@@ -108,11 +119,7 @@ fn start_download_tasks(
 
     let progress2 = progress.clone();
     tokio::spawn(async move {
-        loop {
-            let running_tasks = DOWNLOAD_CONCURRENCY - semaphore.available_permits();
-            if progress2.update_bar("Download", running_tasks) {
-                break;
-            }
+        while progress2.update_bar("Download") {
             tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
         }
     });
@@ -123,10 +130,11 @@ fn start_upload_tasks(
     tasks: Vec<UploadTask>,
     state: Arc<Mutex<State>>,
     client: Client,
+    show_progress: bool,
 ) -> Arc<Progress> {
     let total_tasks = tasks.len();
     let total_bytes = tasks.iter().map(|task| task.lock_size).sum();
-    let progress = Arc::new(Progress::new(total_tasks, total_bytes));
+    let progress = Arc::new(Progress::new(total_tasks, total_bytes, show_progress));
 
     // TODO: Create remote directories first.
     let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
@@ -146,36 +154,39 @@ fn start_upload_tasks(
     }
 
     let progress2 = progress.clone();
-    tokio::spawn(async move {
-        loop {
-            let running_tasks = UPLOAD_CONCURRENCY - semaphore.available_permits();
-            if progress2.update_bar("Upload  ", running_tasks) {
-                break;
+    if show_progress {
+        tokio::spawn(async move {
+            while progress2.update_bar("Upload  ") {
+                tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
             }
-            tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
-        }
-    });
+        });
+    }
     progress
 }
 
 struct Progress {
     total_tasks: usize,
+    running_tasks: AtomicUsize,
     complete_tasks: AtomicUsize,
     failed_tasks: AtomicUsize,
     total_bytes: AtomicU64,
     complete_bytes: AtomicU64,
+    show_progress: bool,
     bar: ProgressBar,
 }
 
 impl Progress {
-    fn new(total_tasks: usize, total_bytes: u64) -> Self {
+    fn new(total_tasks: usize, total_bytes: u64, show_progress: bool) -> Self {
+        // The draw target here doesn't matter, since it will be attached to `MultiBar` later.
         let bar = ProgressBar::new(total_bytes).with_style(progress_style());
         Self {
             total_tasks,
+            running_tasks: 0.into(),
             complete_tasks: 0.into(),
             failed_tasks: 0.into(),
             total_bytes: total_bytes.into(),
             complete_bytes: 0.into(),
+            show_progress,
             bar,
         }
     }
@@ -189,21 +200,43 @@ impl Progress {
         }
     }
 
-    fn task_complete(&self) {
+    fn task_start(&self, msg: String) {
+        if self.show_progress {
+            log::debug!("{}", msg);
+        } else {
+            log::info!("{}", msg);
+        }
+        self.running_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn task_complete(&self, msg: String) {
+        self.running_tasks.fetch_sub(1, Ordering::Relaxed);
         self.complete_tasks.fetch_add(1, Ordering::Relaxed);
+        if self.show_progress {
+            log::debug!("{}", msg);
+        } else {
+            log::info!("{}", msg);
+        }
     }
 
     fn task_fail(&self, msg: String, current: u64, total: u64) {
+        self.running_tasks.fetch_sub(1, Ordering::Relaxed);
         self.failed_tasks.fetch_add(1, Ordering::Relaxed);
         self.complete_bytes.fetch_sub(current, Ordering::Relaxed);
         self.total_bytes.fetch_sub(total, Ordering::Relaxed);
-        self.bar.println(msg);
+        if self.show_progress {
+            log::debug!("{}", msg);
+            self.bar.println(msg);
+        } else {
+            log::error!("{}", msg);
+        }
         self.bar.reset_eta();
         self.bar.reset_elapsed();
     }
 
-    // Upload progress bar and return if completed.
-    fn update_bar(&self, msg: &str, running_tasks: usize) -> bool {
+    // Upload progress bar and return `false` if finished.
+    fn update_bar(&self, msg: &str) -> bool {
+        let running = self.running_tasks.load(Ordering::Relaxed);
         let completed = self.complete_tasks.load(Ordering::Relaxed);
         let failed = self.failed_tasks.load(Ordering::Relaxed);
         let bytes = self.complete_bytes.load(Ordering::Relaxed);
@@ -212,7 +245,7 @@ impl Progress {
             self.bar.set_message(format!(
                 "{} [{}/{}/{} files]",
                 msg,
-                running_tasks.to_string().blue(),
+                running.to_string().blue(),
                 completed.to_string().green(),
                 self.total_tasks
             ));
@@ -220,7 +253,7 @@ impl Progress {
             self.bar.set_message(format!(
                 "{} [{}/{}/{} files, {}]",
                 msg,
-                running_tasks.to_string().blue(),
+                running.to_string().blue(),
                 completed.to_string().green(),
                 self.total_tasks,
                 format!("{} failed", failed).red(),
@@ -231,7 +264,7 @@ impl Progress {
         if finished {
             self.bar.finish();
         }
-        finished
+        !finished
     }
 }
 
@@ -251,10 +284,13 @@ impl Download {
     const RETRY_DELAY: Duration = Duration::from_secs(5);
 
     async fn run(mut self) {
+        self.progress
+            .task_start(format!("Downloading {}", self.task.dest_path.display()));
         match self.run_helper().await {
             Ok(()) => {
                 assert_eq!(self.current_pos, self.task.size);
-                self.progress.task_complete();
+                self.progress
+                    .task_complete(format!("Downloaded: {}", self.task.dest_path.display()));
             }
             Err(err) => {
                 self.progress.task_fail(
@@ -468,9 +504,12 @@ impl Upload {
     const UPLOAD_PART_SIZE: usize = 64 << 20; // 64 MiB
 
     async fn run(mut self) {
+        self.progress
+            .task_start(format!("Uploading: {}", self.task.src_path.display()));
         match self.run_helper().await {
             Ok(()) => {
-                self.progress.task_complete();
+                self.progress
+                    .task_complete(format!("Uploaded: {}", self.task.src_path.display()));
             }
             Err(err) => {
                 let msg = format!(

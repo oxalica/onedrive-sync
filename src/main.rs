@@ -615,15 +615,37 @@ struct OptCommit {
     /// Only commit pending upload.
     #[structopt(long)]
     upload: bool,
+    /// Whether to show options.
+    #[structopt(long, default_value, possible_values = &["auto", "none"])]
+    progress: ProgressOption,
 }
 
-// TODO: Check dirty upload first.
+#[derive(Debug, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "kebab-case")]
+pub enum ProgressOption {
+    Auto,
+    None,
+    // `indicatif` doesn't support force showing progress for non-atty.
+    // Always,
+}
+
+impl Default for ProgressOption {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 async fn main_commit(opt: OptCommit, state: State) -> Result<()> {
     let (download, upload) = match (opt.download, opt.upload) {
         (false, false) => (true, true),
         o => o,
     };
-    commit::commit(state, download, upload).await?;
+    let show_progress = match opt.progress {
+        ProgressOption::Auto => atty::is(atty::Stream::Stderr),
+        ProgressOption::None => false,
+    };
+    log::debug!("show_progress = {}", show_progress);
+    commit::commit(state, download, upload, show_progress).await?;
     Ok(())
 }
 

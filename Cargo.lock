@@ -734,6 +734,7 @@ name = "onedrive-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atty",
  "bytes",
  "colored",
  "dirs",
