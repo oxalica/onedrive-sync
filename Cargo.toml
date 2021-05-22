@@ -15,10 +15,10 @@ filetime = "0.2.14"
 futures = "0.3.15"
 humansize = "1.1.0"
 humantime = "2.1.0"
+indicatif = "0.16.1"
 log = "0.4.14"
 onedrive-api = "0.8.1"
 open = "1.7.0"
-pbr = "1.0.4"
 reqwest = { version = "0.11.3", features = ["stream"] }
 rusqlite = "0.25.1"
 serde = { version = "1.0.125", features = ["derive"] }
