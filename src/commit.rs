@@ -1,5 +1,5 @@
 use crate::state::{DownloadTask, State, Time, UploadTask};
-use anyhow::{bail, ensure, Context, Error, Result};
+use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use colored::Colorize;
 use futures::{channel::mpsc, SinkExt, StreamExt};
@@ -38,6 +38,7 @@ pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     let download_tasks = state.get_pending_download()?;
     let upload_tasks = state.get_pending_upload()?;
 
+    // Pre-check for changed files.
     if upload {
         for task in &upload_tasks {
             let meta = task.src_path.metadata()?;
@@ -53,144 +54,162 @@ pub async fn commit(state: State, download: bool, upload: bool) -> Result<()> {
     }
 
     let state = Arc::new(Mutex::new(state));
-
     let client = Client::new();
 
-    let (err_tx, mut err_rx) = mpsc::channel(1);
     let multi_bar = MultiProgress::new();
-
-    // For println.
-    let mut any_bar = None;
-
+    let (mut download_progress, mut upload_progress) = (None, None);
     if download && !download_tasks.is_empty() {
-        let total_tasks = download_tasks.len();
-        let total_bytes = download_tasks.iter().map(|task| task.size).sum();
-        let progress = Arc::new(Progress::new(total_tasks, total_bytes));
-
-        let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
-        for task in download_tasks {
-            let download = Download {
-                current_pos: 0,
-                task,
-                state: state.clone(),
-                client: client.clone(),
-                progress: progress.clone(),
-                err_tx: err_tx.clone(),
-            };
-            let semaphore = semaphore.clone();
-            tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                download.run().await
-            });
-        }
-
-        let bar = ProgressBar::new(total_bytes).with_style(progress_style());
-        any_bar = Some(bar.clone());
-        multi_bar.add(bar.clone());
-        tokio::spawn(async move {
-            loop {
-                let running_tasks = DOWNLOAD_CONCURRENCY - semaphore.available_permits();
-                if progress.update_bar(&bar, running_tasks, "Download") {
-                    break;
-                }
-                tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
-            }
-        });
+        let progress = start_download_tasks(download_tasks, state.clone(), client.clone());
+        multi_bar.add(progress.bar.clone());
+        download_progress = Some(progress);
     }
-
     if upload && !upload_tasks.is_empty() {
-        let total_tasks = upload_tasks.len();
-        let total_bytes = upload_tasks.iter().map(|task| task.lock_size).sum();
-        let progress = Arc::new(Progress::new(total_tasks, total_bytes));
-
-        // TODO: Create remote directories first.
-        let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
-        for task in upload_tasks {
-            let upload = Upload {
-                task,
-                state: state.clone(),
-                client: client.clone(),
-                progress: progress.clone(),
-                uploaded_bytes: Arc::new(0.into()),
-                err_tx: err_tx.clone(),
-            };
-            let semaphore = semaphore.clone();
-            tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                upload.run().await
-            });
-        }
-
-        let bar = ProgressBar::new(total_bytes).with_style(progress_style());
-        any_bar = Some(bar.clone());
-        multi_bar.add(bar.clone());
-        tokio::spawn(async move {
-            loop {
-                let running_tasks = UPLOAD_CONCURRENCY - semaphore.available_permits();
-                if progress.update_bar(&bar, running_tasks, "Upload  ") {
-                    break;
-                }
-                tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
-            }
-        });
+        let progress = start_upload_tasks(upload_tasks, state.clone(), client.clone());
+        multi_bar.add(progress.bar.clone());
+        upload_progress = Some(progress);
     }
-
-    let any_bar = match any_bar {
-        // No work to do.
-        None => return Ok(()),
-        Some(bar) => bar,
-    };
-
-    // Don't deadlock.
-    drop(err_tx);
-
-    let err_fut = tokio::spawn(async move {
-        let mut failed = 0usize;
-        while let Some(err) = err_rx.next().await {
-            failed += 1;
-            if any_bar.is_hidden() {
-                log::error!("{}", err);
-            } else {
-                any_bar.println(err.to_string());
-            }
-        }
-        failed
-    });
 
     multi_bar.join()?;
 
-    let failed = err_fut.await.unwrap();
+    let failed = download_progress
+        .iter()
+        .chain(&upload_progress)
+        .map(|progress| progress.failed_tasks.load(Ordering::Relaxed))
+        .sum::<usize>();
     ensure!(failed == 0, "{} tasks failed", failed);
 
     Ok(())
+}
+
+fn start_download_tasks(
+    tasks: Vec<DownloadTask>,
+    state: Arc<Mutex<State>>,
+    client: Client,
+) -> Arc<Progress> {
+    let total_tasks = tasks.len();
+    let total_bytes = tasks.iter().map(|task| task.size).sum();
+    let progress = Arc::new(Progress::new(total_tasks, total_bytes));
+
+    let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
+    for task in tasks {
+        let download = Download {
+            current_pos: 0,
+            task,
+            state: state.clone(),
+            client: client.clone(),
+            progress: progress.clone(),
+        };
+        let semaphore = semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            download.run().await
+        });
+    }
+
+    let progress2 = progress.clone();
+    tokio::spawn(async move {
+        loop {
+            let running_tasks = DOWNLOAD_CONCURRENCY - semaphore.available_permits();
+            if progress2.update_bar("Download", running_tasks) {
+                break;
+            }
+            tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
+        }
+    });
+    progress
+}
+
+fn start_upload_tasks(
+    tasks: Vec<UploadTask>,
+    state: Arc<Mutex<State>>,
+    client: Client,
+) -> Arc<Progress> {
+    let total_tasks = tasks.len();
+    let total_bytes = tasks.iter().map(|task| task.lock_size).sum();
+    let progress = Arc::new(Progress::new(total_tasks, total_bytes));
+
+    // TODO: Create remote directories first.
+    let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
+    for task in tasks {
+        let upload = Upload {
+            task,
+            state: state.clone(),
+            client: client.clone(),
+            progress: progress.clone(),
+            uploaded_bytes: Arc::new(0.into()),
+        };
+        let semaphore = semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            upload.run().await
+        });
+    }
+
+    let progress2 = progress.clone();
+    tokio::spawn(async move {
+        loop {
+            let running_tasks = UPLOAD_CONCURRENCY - semaphore.available_permits();
+            if progress2.update_bar("Upload  ", running_tasks) {
+                break;
+            }
+            tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
+        }
+    });
+    progress
 }
 
 struct Progress {
     total_tasks: usize,
     complete_tasks: AtomicUsize,
     failed_tasks: AtomicUsize,
-    total_bytes: u64,
+    total_bytes: AtomicU64,
     complete_bytes: AtomicU64,
+    bar: ProgressBar,
 }
 
 impl Progress {
     fn new(total_tasks: usize, total_bytes: u64) -> Self {
+        let bar = ProgressBar::new(total_bytes).with_style(progress_style());
         Self {
             total_tasks,
             complete_tasks: 0.into(),
             failed_tasks: 0.into(),
-            total_bytes,
+            total_bytes: total_bytes.into(),
             complete_bytes: 0.into(),
+            bar,
         }
     }
 
-    // Set progress bar and return if completed.
-    fn update_bar(&self, bar: &ProgressBar, running_tasks: usize, msg: &str) -> bool {
+    fn advance(&self, bytes: u64, jump: bool) {
+        self.complete_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if jump {
+            log::debug!("Reset ETA");
+            self.bar.reset_eta();
+            self.bar.reset_elapsed();
+        }
+    }
+
+    fn task_complete(&self) {
+        self.complete_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn task_fail(&self, msg: String, current: u64, total: u64) {
+        self.failed_tasks.fetch_add(1, Ordering::Relaxed);
+        self.complete_bytes.fetch_sub(current, Ordering::Relaxed);
+        self.total_bytes.fetch_sub(total, Ordering::Relaxed);
+        self.bar.println(msg);
+        self.bar.reset_eta();
+        self.bar.reset_elapsed();
+    }
+
+    // Upload progress bar and return if completed.
+    fn update_bar(&self, msg: &str, running_tasks: usize) -> bool {
         let completed = self.complete_tasks.load(Ordering::Relaxed);
         let failed = self.failed_tasks.load(Ordering::Relaxed);
         let bytes = self.complete_bytes.load(Ordering::Relaxed);
+        let total_bytes = self.total_bytes.load(Ordering::Relaxed);
         if failed == 0 {
-            bar.set_message(format!(
+            self.bar.set_message(format!(
                 "{} [{}/{}/{} files]",
                 msg,
                 running_tasks.to_string().blue(),
@@ -198,7 +217,7 @@ impl Progress {
                 self.total_tasks
             ));
         } else {
-            bar.set_message(format!(
+            self.bar.set_message(format!(
                 "{} [{}/{}/{} files, {}]",
                 msg,
                 running_tasks.to_string().blue(),
@@ -207,10 +226,10 @@ impl Progress {
                 format!("{} failed", failed).red(),
             ));
         }
-        bar.set_position(bytes);
-        let finished = self.total_tasks == completed + failed && self.total_bytes == bytes;
+        self.bar.set_position(bytes);
+        let finished = self.total_tasks == completed + failed && total_bytes == bytes;
         if finished {
-            bar.finish();
+            self.bar.finish();
         }
         finished
     }
@@ -222,7 +241,6 @@ struct Download {
     state: Arc<Mutex<State>>,
     client: Client,
     progress: Arc<Progress>,
-    err_tx: mpsc::Sender<Error>,
 }
 
 impl Download {
@@ -236,15 +254,18 @@ impl Download {
         match self.run_helper().await {
             Ok(()) => {
                 assert_eq!(self.current_pos, self.task.size);
-                self.progress.complete_tasks.fetch_add(1, Ordering::Relaxed);
+                self.progress.task_complete();
             }
             Err(err) => {
-                self.progress.failed_tasks.fetch_add(1, Ordering::Relaxed);
-                let rest = self.task.size - self.current_pos;
-                self.progress
-                    .complete_bytes
-                    .fetch_add(rest, Ordering::Relaxed);
-                let _ = self.err_tx.send(err).await;
+                self.progress.task_fail(
+                    format!(
+                        "Download failed for {}: {}",
+                        self.task.dest_path.display(),
+                        err,
+                    ),
+                    self.current_pos,
+                    self.task.size,
+                );
             }
         }
     }
@@ -325,9 +346,9 @@ impl Download {
         Ok(())
     }
 
-    fn advance_pos(&mut self, n: u64) {
+    fn advance_pos(&mut self, n: u64, jump: bool) {
         self.current_pos += n;
-        self.progress.complete_bytes.fetch_add(n, Ordering::Relaxed);
+        self.progress.advance(n, jump);
     }
 
     async fn persist_state(&self) -> Result<()> {
@@ -346,7 +367,7 @@ impl Download {
             let got_size = file.metadata().await?.len();
             if got_size == self.task.size {
                 file.seek(SeekFrom::Start(prev_pos)).await?;
-                self.advance_pos(prev_pos);
+                self.advance_pos(prev_pos, true);
                 return Ok(file);
             } else {
                 log::warn!(
@@ -421,7 +442,7 @@ impl Download {
                 "Stream length mismatch",
             );
             file.write_all(&*chunk).await?;
-            self.advance_pos(chunk_len);
+            self.advance_pos(chunk_len, false);
 
             if Self::SAVE_STATE_PERIOD < last_save_time.elapsed() {
                 log::debug!("Download checkpoint");
@@ -441,7 +462,6 @@ struct Upload {
     client: Client,
     progress: Arc<Progress>,
     uploaded_bytes: Arc<AtomicU64>,
-    err_tx: mpsc::Sender<Error>,
 }
 
 impl Upload {
@@ -450,17 +470,18 @@ impl Upload {
     async fn run(mut self) {
         match self.run_helper().await {
             Ok(()) => {
-                self.progress.complete_tasks.fetch_add(1, Ordering::Relaxed);
+                self.progress.task_complete();
             }
             Err(err) => {
-                let mut uploaded =
-                    Arc::try_unwrap(self.uploaded_bytes).expect("Upload request must be finished");
-                let rest = self.task.lock_size - *uploaded.get_mut();
-                self.progress.failed_tasks.fetch_add(1, Ordering::Relaxed);
-                self.progress
-                    .complete_bytes
-                    .fetch_add(rest, Ordering::Relaxed);
-                let _ = self.err_tx.send(err).await;
+                let msg = format!(
+                    "Upload failed for {}: {}",
+                    self.task.src_path.display(),
+                    err,
+                );
+                let current = Arc::try_unwrap(self.uploaded_bytes)
+                    .expect("Upload request must be finished")
+                    .into_inner();
+                self.progress.task_fail(msg, current, self.task.lock_size);
             }
         }
     }
@@ -472,10 +493,8 @@ impl Upload {
             self.upload_empty().await?
         } else {
             let (sess, next_pos) = self.get_or_create_session().await?;
-            self.progress
-                .complete_bytes
-                .fetch_add(next_pos, Ordering::Relaxed);
             self.uploaded_bytes.fetch_add(next_pos, Ordering::Relaxed);
+            self.progress.advance(next_pos, true);
             self.upload_with_session(file, sess, next_pos).await?
         };
 
@@ -617,6 +636,7 @@ impl Upload {
                 .saturating_add(Self::UPLOAD_PART_SIZE as u64)
                 .min(size);
             let chunk_len = (chunk_end - chunk_start) as usize;
+            assert_ne!(chunk_len, 0);
 
             log::debug!("Uploading {}..{}/{} bytes", chunk_start, chunk_end, size);
 
@@ -626,8 +646,8 @@ impl Upload {
             let monitored_body = rx.inspect(move |chunk: &Result<Bytes>| {
                 let len = chunk.as_ref().map_or(0, |bytes| bytes.len()) as u64;
                 log::trace!("Upload {} bytes", len);
-                uploaded_bytes.fetch_add(len, Ordering::Release);
-                progress.complete_bytes.fetch_add(len, Ordering::Relaxed);
+                uploaded_bytes.fetch_add(len, Ordering::Relaxed);
+                progress.advance(len, false);
             });
 
             let stream_fut = file_stream.stream_to(tx, chunk_len as u64);
