@@ -1,4 +1,4 @@
-use crate::state::{DownloadTask, State, Time, UploadTask};
+use crate::state::{DownloadTask, OnedrivePath, State, Time, UploadTask};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
 use colored::Colorize;
@@ -9,6 +9,7 @@ use onedrive_api::{
 };
 use reqwest::{header, Client, StatusCode};
 use std::{
+    collections::HashSet,
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::{
@@ -20,7 +21,7 @@ use std::{
 use tokio::{
     fs::{create_dir_all, rename, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::{Mutex, Semaphore},
+    sync::{oneshot, Mutex, Semaphore},
 };
 
 // 15 Hz to match `indicatif`'s default.
@@ -32,6 +33,12 @@ const UPLOAD_CONCURRENCY: usize = 4;
 fn progress_style() -> ProgressStyle {
     ProgressStyle::default_bar()
         .template("{msg} {bytes}/{total_bytes} {binary_bytes_per_sec} [{bar}] {percent}% ETA {eta_precise}")
+        .progress_chars("=>-")
+}
+
+fn upload_dirs_progress_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("{msg} [{pos}/{len} dirs] {per_sec} [{bar}] {percent}% ETA {eta_precise}")
         .progress_chars("=>-")
 }
 
@@ -64,24 +71,28 @@ pub async fn commit(state: State, download: bool, upload: bool, show_progress: b
     };
     let multi_bar = MultiProgress::with_draw_target(draw_target);
 
-    let (mut download_progress, mut upload_progress) = (None, None);
+    let (mut dirs_bar, mut upload_progress, mut download_progress) = (None, None, None);
+    if upload && !upload_tasks.is_empty() {
+        let (dirs_bar_, progress) =
+            start_upload_tasks(upload_tasks, state.clone(), client.clone(), show_progress).await?;
+        if let Some(bar) = dirs_bar_ {
+            dirs_bar = Some(bar.clone());
+            multi_bar.add(bar);
+        }
+        multi_bar.add(progress.bar.clone());
+        upload_progress = Some(progress);
+    }
     if download && !download_tasks.is_empty() {
         let progress =
             start_download_tasks(download_tasks, state.clone(), client.clone(), show_progress);
         multi_bar.add(progress.bar.clone());
         download_progress = Some(progress);
     }
-    if upload && !upload_tasks.is_empty() {
-        let progress =
-            start_upload_tasks(upload_tasks, state.clone(), client.clone(), show_progress);
-        multi_bar.add(progress.bar.clone());
-        upload_progress = Some(progress);
-    }
 
-    let all_progress = download_progress.iter().chain(&upload_progress);
+    let up_down_progress = download_progress.iter().chain(&upload_progress);
 
     {
-        let _log_redirect_guard = match all_progress.clone().next() {
+        let _log_redirect_guard = match up_down_progress.clone().next() {
             None => return Ok(()),
             Some(prog) if show_progress => Some(
                 crate::logger::LOGGER
@@ -94,9 +105,15 @@ pub async fn commit(state: State, download: bool, upload: bool, show_progress: b
         multi_bar.join()?;
     }
 
-    let failed = all_progress
+    let mut failed = up_down_progress
         .map(|progress| progress.failed_tasks.load(Ordering::Relaxed))
         .sum::<usize>();
+    if let Some(bar) = dirs_bar {
+        if bar.position() != bar.length() {
+            failed += (bar.length() - bar.position()) as usize;
+            failed += upload_progress.as_ref().unwrap().total_tasks;
+        }
+    }
     ensure!(failed == 0, "{} tasks failed", failed);
 
     Ok(())
@@ -131,36 +148,102 @@ fn start_download_tasks(
     progress
 }
 
-fn start_upload_tasks(
+async fn start_upload_tasks(
     tasks: Vec<UploadTask>,
     state: Arc<Mutex<State>>,
     client: Client,
     show_progress: bool,
-) -> Arc<Progress> {
+) -> Result<(Option<ProgressBar>, Arc<Progress>)> {
+    let missing_dirs = state
+        .lock()
+        .await
+        .get_missing_ancestors_for_uploads(&tasks)?;
+    let (dirs_bar, dirs_done_rx) = match missing_dirs.is_empty() {
+        true => (None, None),
+        false => {
+            let (bar, rx) = start_upload_dirs(missing_dirs, state.clone());
+            (Some(bar), Some(rx))
+        }
+    };
+
     let total_tasks = tasks.len();
     let total_bytes = tasks.iter().map(|task| task.lock_size).sum();
     let progress = Arc::new(Progress::new(total_tasks, total_bytes, show_progress));
 
-    // TODO: Create remote directories first.
-    let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
-    for task in tasks {
-        let upload = Upload::new(task, state.clone(), client.clone(), progress.clone());
-        let semaphore = semaphore.clone();
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            upload.run().await
-        });
-    }
-
     let progress2 = progress.clone();
-    if show_progress {
-        tokio::spawn(async move {
-            while progress2.update_bar("  Uploading", "  Upload finished") {
+    tokio::spawn(async move {
+        if let Some(rx) = dirs_done_rx {
+            progress2.bar.set_message("Waiting for dirs");
+            if rx.await.is_err() {
+                progress2.bar.finish_at_current_pos();
+                return;
+            }
+        }
+
+        let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
+        for task in tasks {
+            let upload = Upload::new(task, state.clone(), client.clone(), progress2.clone());
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                upload.run().await
+            });
+        }
+
+        if show_progress {
+            while progress2.update_bar("Uploading", "Upload finished") {
                 tokio::time::sleep(PROGRESS_REFRESH_DURATION).await;
             }
-        });
+        }
+    });
+
+    Ok((dirs_bar, progress))
+}
+
+fn start_upload_dirs(
+    dirs: HashSet<OnedrivePath>,
+    state: Arc<Mutex<State>>,
+) -> (ProgressBar, oneshot::Receiver<()>) {
+    let (tx, rx) = oneshot::channel();
+    let bar = ProgressBar::new(dirs.len() as u64).with_style(upload_dirs_progress_style());
+    bar.set_message("Creating dirs");
+    let bar2 = bar.clone();
+    tokio::spawn(async move {
+        match upload_dirs(dirs, state, &bar2).await {
+            Ok(()) => {
+                let _ = tx.send(());
+            }
+            Err(err) => {
+                log::error!("Failed to create directories: {}", err);
+                bar2.set_message("Create dirs failed");
+                bar2.finish_at_current_pos();
+            }
+        }
+    });
+    (bar, rx)
+}
+
+// TODO: Batch request & concurrency.
+async fn upload_dirs(
+    dirs: HashSet<OnedrivePath>,
+    state: Arc<Mutex<State>>,
+    bar: &ProgressBar,
+) -> Result<()> {
+    let mut dirs = dirs.into_iter().collect::<Vec<_>>();
+    dirs.sort_by(|a, b| Ord::cmp(&a.as_raw_str().len(), &b.as_raw_str().len()));
+
+    let onedrive = state.lock().await.get_or_login().await?;
+    for path in dirs {
+        let (parent, name) = path.split_parent().expect("Root must exist");
+        let item = onedrive
+            .create_folder(ItemLocation::from_path(parent).unwrap(), name)
+            .await?;
+        state.lock().await.add_remote_dirs(&[item])?;
+        bar.inc(1);
     }
-    progress
+
+    bar.finish_with_message("Dirs created");
+    Ok(())
 }
 
 struct Progress {

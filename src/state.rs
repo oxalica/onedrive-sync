@@ -13,6 +13,8 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Borrow,
+    collections::HashSet,
     ffi::OsStr,
     fmt,
     path::{Component, Path, PathBuf},
@@ -161,6 +163,13 @@ impl OnedrivePath {
         .skip(1)
     }
 
+    pub fn split_parent(&self) -> Option<(&str, &FileName)> {
+        let idx = self.0.rfind('/')?;
+        let parent = &self.0[..idx];
+        let name = &self.0[idx + 1..];
+        Some((parent, FileName::new(name).expect("Already checked")))
+    }
+
     pub fn starts_with(&self, prefix: &Self) -> bool {
         let len = prefix.0.len();
         self.0.starts_with(&prefix.0) && self.0.as_bytes().get(len).map_or(true, |&b| b == b'/')
@@ -242,6 +251,12 @@ impl OnedrivePath {
             }
         }
         Ok(this)
+    }
+}
+
+impl Borrow<str> for OnedrivePath {
+    fn borrow(&self) -> &str {
+        self.as_raw_str()
     }
 }
 
@@ -862,6 +877,51 @@ impl State {
         }
 
         txn.commit()?;
+        Ok(())
+    }
+
+    /// Returns all paths of directories which need to be created before upload (missing remote ancestors).
+    ///
+    /// Onedrive API *DOES* automatically create ancestors, but we need to follow foreign key restriction
+    /// when inserting newly uploaded items into database.
+    pub fn get_missing_ancestors_for_uploads(
+        &self,
+        tasks: &[UploadTask],
+    ) -> Result<HashSet<OnedrivePath>> {
+        let mut remote_dirs = HashSet::new();
+        self.get_tree()?
+            .walk(&OnedrivePath::default(), |node, path| {
+                if node.is_directory() {
+                    remote_dirs.insert(path.as_raw_str().to_owned());
+                }
+            });
+
+        Ok(tasks
+            .iter()
+            .flat_map(|task| task.remote_path.raw_ancestors())
+            .filter(|dir| !remote_dirs.contains(*dir))
+            .map(|dir| OnedrivePath::new(dir.as_ref()).unwrap())
+            .collect())
+    }
+
+    pub fn add_remote_dirs(&mut self, items: &[DriveItem]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            r"
+                INSERT INTO `item`
+                (`item_id`, `item_name`, `parent_item_id`, `is_directory`, `size`, `ctag`, `mtime`, `sha1`)
+                VALUES
+                (:item_id, :item_name, :parent_item_id, TRUE, NULL, NULL, NULL, NULL)
+            ",
+        )?;
+        for item in items {
+            let item = Item::parse_raw_item(item)?;
+            assert!(matches!(item.content, ItemContent::Directory));
+            stmt.execute(named_params! {
+                ":item_id": item.id.0,
+                ":item_name": item.name,
+                ":parent_item_id": item.parent.as_ref().expect("Cannot create root").0,
+            })?;
+        }
         Ok(())
     }
 }
