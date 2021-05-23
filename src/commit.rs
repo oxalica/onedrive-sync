@@ -1,4 +1,7 @@
-use crate::state::{DownloadTask, OnedrivePath, State, Time, UploadTask};
+use crate::{
+    state::{DownloadTask, State, UploadTask},
+    util::{OnedrivePath, Time},
+};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
 use colored::Colorize;

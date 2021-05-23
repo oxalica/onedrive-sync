@@ -1,4 +1,7 @@
-use crate::state::{self, OnedrivePath, Time};
+use crate::{
+    state,
+    util::{OnedrivePath, Time},
+};
 use anyhow::{ensure, Context, Result};
 use onedrive_api::ItemId;
 use std::{

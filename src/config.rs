@@ -1,4 +1,4 @@
-use crate::state::OnedrivePath;
+use crate::util::OnedrivePath;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::fs;

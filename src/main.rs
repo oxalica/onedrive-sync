@@ -1,19 +1,24 @@
+use crate::{
+    state::{LoginInfo, Pending, PendingOp, State},
+    tree::{Diff, Tree},
+    util::OnedrivePath,
+};
 use anyhow::{bail, ensure, Context, Result};
 use colored::Colorize;
 use onedrive_api::{Auth, Permission};
-use state::{LoginInfo, OnedrivePath, Pending, PendingOp, State};
-use std::time::{Duration, SystemTime};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 use structopt::StructOpt;
-use tree::Diff;
-
-use crate::tree::Tree;
 
 mod commit;
 mod config;
 mod logger;
 mod state;
 mod tree;
+mod util;
 
 const REDIRECT_URI: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
 
