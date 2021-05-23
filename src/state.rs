@@ -665,7 +665,7 @@ impl State {
             .iter()
             .flat_map(|task| task.remote_path.raw_ancestors())
             .filter(|dir| !remote_dirs.contains(*dir))
-            .map(|dir| OnedrivePath::new(dir.as_ref()).unwrap())
+            .map(|dir| OnedrivePath::from_raw(dir).unwrap())
             .collect())
     }
 

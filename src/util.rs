@@ -23,7 +23,8 @@ impl OnedrivePath {
         Ok(segment)
     }
 
-    pub fn new(path: &Path) -> Result<Self> {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let mut this = Self::default();
         for comp in path.components() {
             match comp {
@@ -34,6 +35,23 @@ impl OnedrivePath {
             }
         }
         Ok(this)
+    }
+
+    /// Construct from raw string returrned by `as_raw_str`.
+    /// This method is stricter than `new` and will emit error for loose format.
+    pub fn from_raw(raw: impl Into<String>) -> Result<Self> {
+        let raw = raw.into();
+        if !raw.is_empty() {
+            ensure!(raw.starts_with('/'), "Invalid raw path: {:?}", raw);
+            ensure!(
+                raw.split('/')
+                    .skip(1)
+                    .all(|segment| Self::validate_segment(segment.as_ref()).is_ok()),
+                "Invalid raw path: {:?}",
+                raw
+            );
+        }
+        Ok(Self(raw))
     }
 
     pub fn as_raw_str(&self) -> &str {
@@ -65,8 +83,9 @@ impl OnedrivePath {
     }
 
     pub fn push(&mut self, segment: impl AsRef<OsStr>) -> Result<()> {
+        let segment = Self::validate_segment(segment.as_ref())?;
         self.0.push('/');
-        self.0.push_str(Self::validate_segment(segment.as_ref())?);
+        self.0.push_str(segment);
         Ok(())
     }
 
@@ -157,14 +176,13 @@ impl fmt::Display for OnedrivePath {
 
 impl rusqlite::ToSql for OnedrivePath {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        self.0.to_sql()
+        self.as_raw_str().to_sql()
     }
 }
 
 impl FromSql for OnedrivePath {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Self::new(Path::new(&String::column_result(value)?))
-            .map_err(|err| FromSqlError::Other(err.into()))
+        Self::from_raw(value.as_str()?.to_owned()).map_err(|err| FromSqlError::Other(err.into()))
     }
 }
 
@@ -174,8 +192,8 @@ impl<'de> serde::Deserialize<'de> for OnedrivePath {
         D: serde::de::Deserializer<'de>,
     {
         use serde::de::Error;
-        let s = <&str>::deserialize(deserializer)?;
-        Self::new(Path::new(s)).map_err(D::Error::custom)
+        let s = String::deserialize(deserializer)?;
+        Self::from_raw(s).map_err(D::Error::custom)
     }
 }
 
@@ -223,16 +241,145 @@ impl FromSql for Time {
 }
 
 #[cfg(test)]
-mod test {
+mod onedrive_path_test {
     use super::OnedrivePath;
+    use std::path::Path;
+
+    fn new(s: &str) -> OnedrivePath {
+        OnedrivePath::new(s).unwrap()
+    }
 
     #[test]
-    fn test_onedrive_path_relative_to() {
+    fn test_default() {
+        let a = OnedrivePath::default();
+        let b = new("/");
+        assert!(a.0.is_empty());
+        assert!(b.0.is_empty());
+    }
+
+    #[test]
+    fn test_validate_segment() {
+        let validate = |s: &str| OnedrivePath::validate_segment(s.as_ref()).map(|s| s.to_owned());
+        assert_eq!(validate("foo").unwrap(), "foo");
+        assert_eq!(validate(".bar").unwrap(), ".bar");
+        assert!(validate("").is_err());
+        assert!(validate(".").is_err());
+        assert!(validate("..").is_err());
+        assert!(validate("a:b").is_err());
+        assert!(validate("a/b").is_err());
+    }
+
+    #[test]
+    fn test_new() {
+        let new = |s: &str| OnedrivePath::new(s).map(|s| s.0);
+        assert_eq!(new("foo").unwrap(), "/foo");
+        assert_eq!(new("").unwrap(), "");
+        assert_eq!(new("/").unwrap(), "");
+        assert_eq!(new(".").unwrap(), "");
+        assert_eq!(new("/foo").unwrap(), "/foo");
+        assert_eq!(new("//foo//").unwrap(), "/foo");
+        assert_eq!(new("./foo/.//bar/..hidden").unwrap(), "/foo/bar/..hidden");
+
+        assert!(new("..").is_err());
+        assert!(new("./foo/..").is_err());
+        assert!(new("./foo/../bar").is_err());
+    }
+
+    #[test]
+    fn test_from_raw() {
+        assert_eq!(OnedrivePath::from_raw("").unwrap().0, "");
+        assert_eq!(OnedrivePath::from_raw("/foo").unwrap().0, "/foo");
+        assert!(OnedrivePath::from_raw("foo").is_err());
+        assert!(OnedrivePath::from_raw("/").is_err());
+        assert!(OnedrivePath::from_raw("/foo/").is_err());
+        assert!(OnedrivePath::from_raw("/foo/./bar").is_err());
+    }
+
+    #[test]
+    fn test_ancestors() {
+        let ancestors = |s: &str| {
+            new(s)
+                .raw_ancestors()
+                .map(|s| s.to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ancestors("/"), &[] as &[&str]);
+        assert_eq!(ancestors("/foo"), &[""]);
+        assert_eq!(ancestors("/foo/bar"), &["/foo", ""]);
+        assert_eq!(ancestors("/a/b/c/d"), &["/a/b/c", "/a/b", "/a", ""]);
+    }
+
+    #[test]
+    fn test_split_parent() {
+        assert!(new("/").split_parent().is_none());
+
+        let p = new("/foo");
+        let (parent, name) = p.split_parent().unwrap();
+        assert_eq!(parent, "");
+        assert_eq!(name.as_str(), "foo");
+
+        let p = new("/foo/bar/baz");
+        let (parent, name) = p.split_parent().unwrap();
+        assert_eq!(parent, "/foo/bar");
+        assert_eq!(name.as_str(), "baz");
+    }
+
+    #[test]
+    fn test_starts_with() {
+        let starts_with = |a: &str, b: &str| new(a).starts_with(&new(b));
+
+        assert!(starts_with("/", "/"));
+        assert!(!starts_with("/", "/foo"));
+        assert!(starts_with("/foo/bar", "/foo/bar"));
+
+        assert!(starts_with("/foo/bar", "/"));
+        assert!(!starts_with("/foo/bar", "/fo"));
+        assert!(starts_with("/foo/bar", "/foo"));
+        assert!(!starts_with("/foo/bar", "/foo/ba"));
+        assert!(starts_with("/foo/bar", "/foo/bar"));
+        assert!(!starts_with("/foo/bar", "/foo/bar/baz"));
+    }
+
+    #[test]
+    fn test_iter() {
+        let iters = |s: &str| new(s).iter().map(|s| s.to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(iters("/"), &[] as &[&str]);
+        assert_eq!(iters("/foo"), &["foo"]);
+        assert_eq!(iters("/foo/bar"), &["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_push_pop() {
+        let mut p = new("/");
+        assert!(p.push("foo").is_ok());
+        assert!(p.push(".").is_err());
+        assert!(p.push("..").is_err());
+        assert!(p.push("...").is_ok());
+        assert!(p.push(".foo").is_ok());
+        assert_eq!(p.0, "/foo/.../.foo");
+        assert!(p.pop());
+        assert_eq!(p.0, "/foo/...");
+        assert!(p.pop());
+        assert_eq!(p.0, "/foo");
+        assert!(p.pop());
+        assert_eq!(p.0, "");
+        assert!(!p.pop());
+        assert_eq!(p.0, "");
+    }
+
+    #[test]
+    fn test_root_at() {
+        assert_eq!(new("/").root_at("/foo"), Path::new("/foo"));
+        assert_eq!(new("/foo/bar").root_at("/baz"), Path::new("/baz/foo/bar"));
+    }
+
+    #[test]
+    fn test_relative_to() {
         #[track_caller]
         fn check(path: &str, cwd: &str, expect: &str) {
-            let path = OnedrivePath::new(path.as_ref()).unwrap();
-            let cwd = OnedrivePath::new(cwd.as_ref()).unwrap();
-            assert_eq!(path.relative_to(&cwd), expect);
+            assert_eq!(new(path).relative_to(&new(cwd)), expect);
         }
 
         check("/foo/bar/baz", "/", "./foo/bar/baz");
@@ -248,5 +395,83 @@ mod test {
         check("/foo/bar/baz", "/foo/aaa/bbb", "../../bar/baz");
         check("/foo/bar/baz", "/aaa", "../foo/bar/baz");
         check("/foo/bar/baz", "/aaa/bbb", "../../foo/bar/baz");
+    }
+
+    #[test]
+    fn test_join_self() {
+        let join = |a: &str, b: &str| new(a).join(&new(b)).0;
+        assert_eq!(join("", ""), "");
+        assert_eq!(join("/foo", ""), "/foo");
+        assert_eq!(join("", "/foo"), "/foo");
+        assert_eq!(join("/foo", "/bar"), "/foo/bar");
+    }
+
+    #[test]
+    fn test_join_str() {
+        let join = |a: &str, b: &str| new(a).join_str(b).map(|p| p.0);
+        assert_eq!(join("/", "foo").unwrap(), "/foo");
+        assert_eq!(join("/foo", "bar").unwrap(), "/foo/bar");
+        assert!(join("/", "").is_err());
+        assert!(join("/", "a:b").is_err());
+        assert!(join("/foo", "bar/baz").is_err());
+    }
+
+    #[test]
+    fn test_join_os() {
+        let join = |a: &str, b: &str| new(a).join_os(b).map(|s| s.0);
+        assert!(join("/", "/").is_err());
+        assert!(join("/", "/foo/bar").is_err());
+        assert!(join("/", "..").is_err());
+        assert_eq!(join("/", ".").unwrap(), "");
+        assert_eq!(join("/", "foo/bar").unwrap(), "/foo/bar");
+        assert_eq!(join("/", "./foo/bar").unwrap(), "/foo/bar");
+        assert_eq!(join("/foo/bar", "baz").unwrap(), "/foo/bar/baz");
+        assert_eq!(join("/foo/bar", "..").unwrap(), "/foo");
+        assert_eq!(
+            join("/foo/bar", "./../hello/../wtf/./deep").unwrap(),
+            "/foo/wtf/deep",
+        );
+        assert_eq!(join("/foo/bar", "../../root/..").unwrap(), "");
+        assert!(join("/foo/bar", "../../root/../..").is_err());
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(new("/").to_string(), "/");
+        assert_eq!(new("/foo").to_string(), "/foo");
+        assert_eq!(new("/foo/bar/").to_string(), "/foo/bar");
+    }
+
+    #[test]
+    fn test_de() {
+        #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+        struct Foo {
+            a: OnedrivePath,
+        }
+
+        assert_eq!(
+            serde_json::from_str::<Foo>(r#"{"a":""}"#).unwrap(),
+            Foo { a: new("") },
+        );
+        assert_eq!(
+            serde_json::from_str::<Foo>(r#"{"a":"/foo/bar"}"#).unwrap(),
+            Foo { a: new("/foo/bar") },
+        );
+        assert!(serde_json::from_str::<Foo>(r#"{"a":".."}"#).is_err());
+        assert!(serde_json::from_str::<Foo>(r#"{"a":"foo/bar"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod time_test {
+    use super::Time;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn test_to_from_str() {
+        let s = "2020-05-23T18:30:15.123456789Z";
+        let sys = SystemTime::UNIX_EPOCH + Duration::new(1590258615, 123456789);
+        assert_eq!(Time::from(sys).to_string(), s);
+        assert_eq!(SystemTime::from(s.parse::<Time>().unwrap()), sys);
     }
 }
