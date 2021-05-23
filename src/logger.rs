@@ -56,7 +56,6 @@ impl Logger {
 
         log::set_logger(logger).unwrap();
         log::set_max_level(logger.env_logger.filter());
-        log::warn!("foo");
     }
 
     pub fn attach_to(&self, bar: ProgressBar) -> LogRedirectGuard<'_> {
